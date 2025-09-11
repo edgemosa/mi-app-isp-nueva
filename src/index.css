@@ -1,0 +1,74 @@
+/* src/index.css */
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #1a1a1a;
+  background-color: #fafafa;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60vh;
+}
+/* === Badges para estado "PENDIENTE" === */
+.badge {
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-weight: 700;
+  font-size: 0.8rem;
+  display: inline-block;
+  line-height: 1.6;
+  letter-spacing: 0.2px;
+  user-select: none;
+  border: 1px solid transparent;
+  /* ayuda a que el texto siempre sea legible */
+  text-transform: uppercase;
+}
+
+.badge-green {
+  background: #dcfce7;   /* verde claro */
+  color: #166534;        /* verde oscuro */
+  border-color: #86efac;
+}
+
+.badge-yellow {
+  background: #fef9c3;   /* amarillo claro */
+  color: #854d0e;        /* marrón oscuro */
+  border-color: #fde68a;
+}
+
+.badge-red {
+  background: #fee2e2;   /* rojo claro */
+  color: #991b1b;        /* rojo oscuro */
+  border-color: #fca5a5;
+}
+/* === Badges para estado "PENDIENTE" === */
+.badge {
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-weight: 700;
+  font-size: 0.8rem;
+  display: inline-block;
+  line-height: 1.6;
+  letter-spacing: 0.2px;
+  user-select: none;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+}
+.badge-green { background: #dcfce7; color: #166534; border-color: #86efac; }
+.badge-yellow{ background: #fef9c3; color: #854d0e; border-color: #fde68a; }
+.badge-red   { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }

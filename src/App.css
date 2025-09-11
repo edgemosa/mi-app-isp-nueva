@@ -1,0 +1,26 @@
+/* src/App.css */
+.app {
+  padding: 20px;
+}
+
+h2 {
+  margin-bottom: 10px;
+}
+
+.card {
+  background: #fff;
+  border: 1px solid #eee;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
+button {
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+button:hover {
+  opacity: 0.9;
+}

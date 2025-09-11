@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "capcorp-77ab7",
+    "prod": "capcorp-77ab7"
+  },
+  "targets": {},
+  "etags": {}
+}
