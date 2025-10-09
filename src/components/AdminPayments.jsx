@@ -12,8 +12,16 @@ import {
   writeBatch,
 } from "firebase/firestore";
 
-/* ========== Helpers ========== */
-const todayISO = () => new Date().toISOString().slice(0, 10);
+/* ========== Helpers (alineados con AdminPanel) ========== */
+// Fecha local YYYY-MM-DD (no UTC)
+const todayISO = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+
 const money = (n) => `$${Number(n || 0).toFixed(2)}`;
 const uniqById = (arr) => Array.from(new Map(arr.map((x) => [x.id, x])).values());
 
@@ -45,9 +53,7 @@ function consolidatePayments(rows) {
     } else {
       const amt = Number(cur.amount || 0) + Number(p.amount || 0);
       const newer =
-        (p.createdAt?.toMillis?.() || 0) > (cur.createdAt?.toMillis?.() || 0)
-          ? p
-          : cur;
+        (p.createdAt?.toMillis?.() || 0) > (cur.createdAt?.toMillis?.() || 0) ? p : cur;
       map.set(k, { ...newer, amount: amt, _ids: [...(cur._ids || []), p.id] });
     }
   }
@@ -59,16 +65,16 @@ function formatRowDateTime(p) {
   const datePart =
     typeof p.batchDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(p.batchDate)
       ? p.batchDate
-      : (p.createdAt?.toDate?.()
-          ? p.createdAt.toDate().toISOString().slice(0, 10)
-          : "—");
+      : p.createdAt?.toDate?.()
+      ? p.createdAt.toDate().toISOString().slice(0, 10)
+      : "—";
   const timePart = p.createdAt?.toDate?.()
     ? p.createdAt.toDate().toLocaleTimeString()
     : "—";
   return `${datePart} ${timePart}`;
 }
 
-export default function AdminPayments() {
+export default function AdminPayments({ onAction }) {
   const [dateSel, setDateSel] = useState(todayISO());
   const [statusSel, setStatusSel] = useState("submitted");
 
@@ -114,6 +120,7 @@ export default function AdminPayments() {
 
     const start = new Date(dateSel + "T00:00:00");
     const end = new Date(dateSel + "T23:59:59.999");
+    // Buffer ±6h por si el cliente está cerca del cambio de día
     const startBuf = new Date(start.getTime() - 6 * 60 * 60 * 1000);
     const endBuf = new Date(end.getTime() + 6 * 60 * 60 * 1000);
 
@@ -187,6 +194,7 @@ export default function AdminPayments() {
       });
     });
     await batch.commit();
+    onAction?.(); // cierra popover si viene desde AdminPanel
   };
 
   const rejectPayment = async (p) => {
@@ -196,11 +204,13 @@ export default function AdminPayments() {
       batch.update(doc(db, "payments", id), {
         status: "rejected",
         rejectedAt: serverTimestamp(),
+        rejectedBy: currentUserEmail, // añadido para trazabilidad
         updatedAt: serverTimestamp(),
         updatedBy: currentUserEmail,
       });
     });
     await batch.commit();
+    onAction?.();
   };
 
   return (

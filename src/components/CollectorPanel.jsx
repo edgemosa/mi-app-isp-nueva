@@ -1,5 +1,5 @@
 // src/components/CollectorPanel.jsx
-import React, { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   collection,
   query,
@@ -17,52 +17,6 @@ import { signOut } from "firebase/auth";
 import localforage from "localforage";
 
 /* =================== Helpers =================== */
-// === estilos de chips sin CSS global
-const chipStyle = (bg, color, border) => ({
-  fontSize: 12,
-  padding: "2px 8px",
-  borderRadius: 12,
-  background: bg,
-  color,
-  border: `1px solid ${border}`,
-  marginRight: 8,
-  textTransform: "uppercase",
-  fontWeight: 700,
-});
-
-// semáforo para "pendiente" cuando ya llegó la fecha
-const pendingSemaforoStyle = (daysLate) => {
-  if (daysLate >= 8)   return chipStyle("#ffeaea", "#a40000", "#f5bcbc"); // rojo
-  if (daysLate >= 4)   return chipStyle("#fff7e6", "#8a5700", "#f3c38a"); // amarillo
-  return chipStyle("#e8f7e8", "#166534", "#bde5bd");                      // verde
-};
-
-// util: días de atraso desde la fecha de cobro del ciclo
-const daysLateForClient = (client, todayISO = new Date().toISOString().slice(0,10)) => {
-  const _daysInMonth = (y, m) => new Date(y, m, 0).getDate();
-  const _parseYMD = (iso) => { const [y,m,d]=String(iso||"").split("-").map(Number); return {y,m,d}; };
-  const _currentDueDateFromInstall = (installISO, refISO) => {
-    if (!installISO) return refISO;
-    const { d:dayInstall } = _parseYMD(installISO);
-    const { y, m } = _parseYMD(refISO);
-    const dayThisMonth = Math.min(dayInstall, _daysInMonth(y, m));
-    const dueThisMonth = `${y}-${String(m).padStart(2,"0")}-${String(dayThisMonth).padStart(2,"0")}`;
-    if (refISO < dueThisMonth) {
-      const prev = new Date(`${y}-${String(m).padStart(2,"0")}-01T00:00:00`); prev.setDate(0);
-      const py = prev.getFullYear(), pm = prev.getMonth()+1;
-      const dayPrev = Math.min(dayInstall, _daysInMonth(py, pm));
-      return `${py}-${String(pm).padStart(2,"0")}-${String(dayPrev).padStart(2,"0")}`;
-    }
-    return dueThisMonth;
-  };
-  const dueISO = _currentDueDateFromInstall(
-    client?.installDate || client?.installationDate || client?.fechaInstalacion,
-    todayISO
-  );
-  const A = new Date(`${dueISO}T00:00:00`), B = new Date(`${todayISO}T00:00:00`);
-  return Math.floor((B - A) / 86_400_000); // días
-};
-
 const money = (n) =>
   Number(n || 0).toLocaleString("en-US", { style: "currency", currency: "USD" });
 
@@ -126,11 +80,12 @@ const isExactDueDayThisCycle = (fechaInstalacionISO) => {
   return today.getDate() === dueDay;
 };
 
+/* ===== Consolidación igual que Admin ===== */
 function paymentKey(p) {
-  const clientId  = String(p.clientId || "");
-  const per       = String(p.period   || "");
-  const batchDate = String(p.batchDate|| "");
-  const createdBy = String(p.createdBy|| "");
+  const clientId = String(p.clientId || "");
+  const per = String(p.period || "");
+  const batchDate = String(p.batchDate || "");
+  const createdBy = String(p.createdBy || "");
   return `${clientId}__${per}__${batchDate}__${createdBy}`;
 }
 
@@ -163,6 +118,7 @@ const formatBatchDateTime = (p) => {
   return (datePart && timePart) ? `${datePart} ${timePart}` : (datePart || "—");
 };
 
+/* ======= MISMO cálculo que Admin ======= */
 const dueReachedThisMonth = (fechaInstalacionISO) => {
   if (!fechaInstalacionISO) return false;
   const install = new Date(`${fechaInstalacionISO}T00:00:00`);
@@ -189,10 +145,7 @@ const planForYM = (client, ym) => {
 
 const computeArrears = (c, ymNowStr, approvedByClientByPeriod) => {
   if (c.exonerado) return 0;
-
   const installYM = ymFromISO(c.fechaInstalacion);
-  if (!installYM) return 0; // ← Guard: si no hay fecha de instalación, no hay mora
-
   const [y, m] = ymNowStr.split("-").map(Number);
   const prev = `${m === 1 ? y - 1 : y}-${String(m === 1 ? 12 : m - 1).padStart(2, "0")}`;
 
@@ -215,19 +168,31 @@ const computeArrears = (c, ymNowStr, approvedByClientByPeriod) => {
   return Math.max(theoretical - approved, 0);
 };
 
-
-/* === Badge “PENDIENTE” con colores (igual que Admin) === */
-const _daysInMonth = (y, m) => new Date(y, m, 0).getDate();
-const _parseYMD = (iso) => {
-  if (!iso || typeof iso !== "string") return { y: NaN, m: NaN, d: NaN };
-  const [y, m, d] = iso.split("-").map(Number);
-  return { y, m, d };
-};
+/* === NUEVOS helpers copiados del Admin para el semáforo === */
+// Diferencia en meses AÑO/MES (ignora el día): aniversarios cumplidos
+function monthsPastAnniversaries(installISO, ref = new Date()) {
+  if (!installISO) return 0;
+  const inst = new Date(`${installISO}T00:00:00`);
+  if (Number.isNaN(inst.getTime())) return 0;
+  if (ref < inst) return 0;
+  const totalMonths =
+    (ref.getFullYear() - inst.getFullYear()) * 12 +
+    (ref.getMonth() - inst.getMonth());
+  const reachedCutThisMonth = ref.getDate() >= inst.getDate();
+  const months = totalMonths - (reachedCutThisMonth ? 0 : 1);
+  return Math.max(0, months);
+}
 const _todayISO = (d = new Date()) => {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+};
+const _daysInMonth = (y, m) => new Date(y, m, 0).getDate();
+const _parseYMD = (iso) => {
+  if (!iso || typeof iso !== "string") return { y: NaN, m: NaN, d: NaN };
+  const [y, m, d] = iso.split("-").map(Number);
+  return { y, m, d };
 };
 const _diffDays = (fromISO, toISO = _todayISO()) => {
   if (!fromISO) return 0;
@@ -255,29 +220,22 @@ const _currentDueDateFromInstall = (installISO, refISO = _todayISO()) => {
   }
   return dueThisMonth;
 };
-/** Devuelve {label, cls} para pintar “PENDIENTE” según días de atraso. */
-const pendingBadgeForClient = (client, today = (typeof todayISO === "function" ? todayISO() : _todayISO())) => {
+const pendingBadgeForClient = (client, today = _todayISO()) => {
   const dueISO =
     client?._dueISO ||
-    _currentDueDateFromInstall(
-      client?.installDate || client?.installationDate || client?.fechaInstalacion,
-      today
-    );
+    _currentDueDateFromInstall(client?.fechaInstalacion, today);
   const delta = _diffDays(dueISO, today);
-  let cls = "badge-green";      // 0–3
+  let cls = "badge-green";
   if (delta >= 4 && delta <= 7) cls = "badge-yellow";
-  else if (delta >= 8)          cls = "badge-red";
+  else if (delta >= 8) cls = "badge-red";
   return { label: "PENDIENTE", cls };
 };
-
-// Ícono billete
-const CASH_SVG =
-  "data:image/svg+xml;base64," +
-  (typeof btoa === "function"
-    ? btoa(
-        `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="#111" viewBox="0 0 24 24"><path d="M3 7h18a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm0 2v6h18V9H3zm3 1a3 3 0 0 0 0 4h0a3 3 0 0 0 0-4zm12 0a3 3 0 0 1 0 4h0a3 3 0 0 1 0-4zM12 10a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/></svg>`
-      )
-    : "");
+const badgeStyle = (cls) => {
+  if (cls === "badge-red")    return { background: "#fee2e2", color: "#991b1b", border: "1px solid #fecaca" };
+  if (cls === "badge-yellow") return { background: "#fef9c3", color: "#92400e", border: "1px solid #fde68a" };
+  if (cls === "badge-green")  return { background: "#dcfce7", color: "#166534", border: "1px solid #bbf7d0" };
+  return { background: "#f1f5f9", color: "#0f172a", border: "1px solid #e2e8f0" };
+};
 
 /* === IndexedDB (localforage) para borrador local === */
 const draftStore = localforage.createInstance({
@@ -378,7 +336,7 @@ export default function CollectorPanel() {
     return unsub;
   }, []);
 
-  // === Consolidado approved y submitted ===
+  // === IMPORTANTE: consolidamos approved y submitted como en Admin ===
   useEffect(() => {
     const unsub = onSnapshot(
       query(collection(db, "payments"), where("status", "==", "approved")),
@@ -566,13 +524,22 @@ export default function CollectorPanel() {
       const sbMes  = submittedByClientByPeriod.get(c.id)?.get(PERIOD) || 0;
       const saldoMes = Math.max(planMes - apMes, 0);
       const saldoMesAfterSubmitted = Math.max(planMes - apMes - sbMes, 0);
-      const estadoMes = c.exonerado ? "EXONERADO" : (saldoMes <= 0 ? "PAGADO" : "PENDIENTE");
 
       const arrears = computeArrears(c, PERIOD, approvedByClientByPeriod);
       const dueReached = dueReachedThisMonth(c.fechaInstalacion);
 
       const isFutureInstall = installDate ? today < installDate : false;
       const isDueToday = isExactDueDayThisCycle(c.fechaInstalacion);
+
+      // NUEVO: meses vencidos por aniversario (como Admin)
+      const monthsDue = monthsPastAnniversaries(c.fechaInstalacion);
+
+      // NUEVO: badge por meses vencidos (1 = amarillo, >=2 = rojo)
+      let badge = null;
+      if (!c.exonerado && saldoMes > 0) {
+        if (monthsDue >= 2) badge = { label: "PENDIENTE", cls: "badge-red" };
+        else if (monthsDue === 1) badge = { label: "PENDIENTE", cls: "badge-yellow" };
+      }
 
       return {
         ...c,
@@ -589,10 +556,11 @@ export default function CollectorPanel() {
         submittedMes: sbMes,
         saldoMes,
         saldoMesAfterSubmitted,
-        estadoMes,
 
         arrears,
         dueReached,
+        monthsDue,
+        badge,
 
         isDueToday,
         isFutureInstall,
@@ -631,7 +599,7 @@ export default function CollectorPanel() {
     if (filtroEstado === "Exonerados") {
       arr = arr.filter((c) => !!c.exonerado);
     } else if (filtroEstado === "Pagados") {
-      arr = arr.filter((c) => !c.exonerado && c.saldoMes <= 0);
+      arr = arr.filter((c) => !c.exonerado && c.saldoMesAfterSubmitted <= 0);
     } else if (filtroEstado === "Pendientes") {
       arr = arr.filter(
         (c) => !c.exonerado && (c.arrears > 0 || (c.dueReached && c.saldoMes > 0))
@@ -1125,9 +1093,107 @@ Ingresa monto (<= restante):`,
 
             const trabajoHoy = (hoyPorCliente[c.id] || 0) > 0 || porEnviar > 0;
 
+            // === BADGE sincronizado con Admin ===
+            let estadoChip = null;
+            if (c.exonerado) {
+              estadoChip = (
+                <span
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 8px",
+                    borderRadius: 12,
+                    marginRight: 8,
+                    background: "#f3e8ff",
+                    color: "#6b21a8",
+                    border: "1px solid #e9d5ff",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  EXONERADO
+                </span>
+              );
+            } else if (c.saldoMes <= 0) {
+              estadoChip = (
+                <span
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 8px",
+                    borderRadius: 12,
+                    marginRight: 8,
+                    background: "#e0f2fe",
+                    color: "#0369a1",
+                    border: "1px solid #bae6fd",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  PAGADO
+                </span>
+              );
+            } else if (c.badge) {
+              estadoChip = (
+                <span
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 8px",
+                    borderRadius: 12,
+                    marginRight: 8,
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    ...badgeStyle(c.badge.cls),
+                  }}
+                  title={
+                    c.monthsDue >= 2
+                      ? "Tiene 2 meses o más vencidos desde la instalación"
+                      : "Tiene 1 mes vencido desde la instalación"
+                  }
+                >
+                  {c.badge.label}
+                </span>
+              );
+            } else if (!c.dueReached) {
+              // antes de llegar al día de corte de este mes → morado (como Admin)
+              estadoChip = (
+                <span
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 8px",
+                    borderRadius: 12,
+                    marginRight: 8,
+                    background: "#f5e8ff",
+                    color: "#6b21a8",
+                    border: "1px solid #e9d5ff",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  PENDIENTE
+                </span>
+              );
+            } else {
+              // semáforo por días desde el vencimiento (verde/amarillo/rojo)
+              const { label, cls } = pendingBadgeForClient(c);
+              estadoChip = (
+                <span
+                  style={{
+                    fontSize: 12,
+                    padding: "2px 8px",
+                    borderRadius: 12,
+                    marginRight: 8,
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    ...badgeStyle(cls),
+                  }}
+                >
+                  {label}
+                </span>
+              );
+            }
+
             return (
-              <Fragment key={c.id}>
-                <tr style={{ borderTop: "1px solid #eee" }}>
+              <>
+                <tr key={c.id} style={{ borderTop: "1px solid #eee" }}>
                   <td style={{ padding: "10px 6px" }}>
                     <b>{c.nombre}</b>{" "}
                     <span style={{ color: "#777", fontSize: 12 }}>
@@ -1135,57 +1201,29 @@ Ingresa monto (<= restante):`,
                     </span>
                   </td>
                   <td style={{ padding: "10px 6px" }}>
-  {/* chip de estado (mismos colores que Admin) */}
-{c.exonerado ? (
-  // EXONERADO -> púrpura
-  <span style={chipStyle("#f3e8ff", "#6b21a8", "#e9d5ff")}>EXONERADO</span>
-) : c.saldoMes <= 0 ? (
-  // PAGADO -> azul claro
-  <span style={chipStyle("#e0f2fe", "#0369a1", "#bae6fd")}>PAGADO</span>
-) : !c.dueReached ? (
-  // Pendiente pero aún NO llega la fecha -> lila (igual Admin)
-  <span style={chipStyle("#ede9fe", "#5b21b6", "#ddd6fe")}>PENDIENTE</span>
-) : (
-  // Pendiente con fecha ya vencida: semáforo
-  (() => {
-    const { label, cls } = pendingBadgeForClient(c);
-    const styleMap = {
-      "badge-green":  chipStyle("#e8f7e8", "#166534", "#bde5bd"),
-      "badge-yellow": chipStyle("#fff7e6", "#8a5700", "#f3c38a"),
-      "badge-red":    chipStyle("#ffeaea", "#a40000", "#f5bcbc"),
-    };
-    return <span style={styleMap[cls]}>{label}</span>;
-  })()
-)}
-
-    
-
-  <span>
-    Saldo (acum.): <b>{money(c.saldo)}</b>
-  </span>
-
-  {c.isDueToday && c.saldoMes > 0 && (
-    <span style={{ marginLeft: 8, fontSize: 11, color: "#a40000" }}>vence hoy</span>
-  )}
-
-  {((hoyPorCliente[c.id] || 0) > 0 || carrito.some(it => it.clientId === c.id)) && (
-    <span
-      style={{
-        marginLeft: 8,
-        fontSize: 11,
-        padding: "2px 6px",
-        borderRadius: 999,
-        border: "1px solid #cde",
-        background: "#eef5ff",
-        color: "#356",
-      }}
-    >
-      trabajado {batchDate}
-    </span>
-  )}
-</td>
-
-
+                    {estadoChip}
+                    Saldo (acum.): {money(c.saldo)}{" "}
+                    {c.isDueToday && c.saldoMes > 0 && (
+                      <span style={{ marginLeft: 8, fontSize: 11, color: "#a40000" }}>
+                        vence hoy
+                      </span>
+                    )}
+                    {trabajoHoy && (
+                      <span
+                        style={{
+                          marginLeft: 8,
+                          fontSize: 11,
+                          padding: "2px 6px",
+                          borderRadius: 999,
+                          border: "1px solid #cde",
+                          background: "#eef5ff",
+                          color: "#356",
+                        }}
+                      >
+                        trabajado {batchDate}
+                      </span>
+                    )}
+                  </td>
                   <td style={{ padding: "10px 6px" }}>
                     <button
                       onClick={() => {
@@ -1216,7 +1254,6 @@ Ingresa monto (<= restante):`,
                           : (saldoDisponible > 0 ? "Agregar al lote" : "Sin saldo disponible")
                       }
                     >
-                      <img src={CASH_SVG} alt="" width={14} height={14} />
                       Cobrar
                     </button>
                   </td>
@@ -1255,7 +1292,7 @@ Ingresa monto (<= restante):`,
                     </td>
                   </tr>
                 )}
-              </Fragment>
+              </>
             );
           })}
         </tbody>

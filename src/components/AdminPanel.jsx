@@ -1,6 +1,8 @@
 // src/components/AdminPanel.jsx
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db, auth } from "../lib/firebase";
+import AuditoriaPagos from "./AuditoriaPagos";
 import {
   collection,
   query,
@@ -17,6 +19,7 @@ import {
 } from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import AdminPayments from "./AdminPayments";
+import AdminFixTool from "./AdminFixTool";
 
 /* ========== Helpers ========== */
 const COLLECTOR_ALIASES = {
@@ -33,15 +36,22 @@ const money = (n) => {
   return `$${x.toFixed(2)}`;
 };
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// ✅ Fecha LOCAL (no UTC)
+const todayISO = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+
 const currentPeriod = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 };
 const period = currentPeriod();
 
-const uniqById = (arr) =>
-  Array.from(new Map(arr.map((x) => [x.id, x])).values());
+const uniqById = (arr) => Array.from(new Map(arr.map((x) => [x.id, x])).values());
 
 // === Clave lógica de un pago (para consolidar duplicados legacy)
 function paymentKey(p) {
@@ -51,6 +61,7 @@ function paymentKey(p) {
   const createdBy = String(p.createdBy || "");
   return `${clientId}__${per}__${batchDate}__${createdBy}`;
 }
+
 // Consolida por clave: suma amount y toma createdAt más reciente
 function consolidatePayments(rows) {
   const map = new Map();
@@ -62,9 +73,7 @@ function consolidatePayments(rows) {
     } else {
       const amt = Number(cur.amount || 0) + Number(p.amount || 0);
       const newer =
-        (p.createdAt?.toMillis?.() || 0) > (cur.createdAt?.toMillis?.() || 0)
-          ? p
-          : cur;
+        (p.createdAt?.toMillis?.() || 0) > (cur.createdAt?.toMillis?.() || 0) ? p : cur;
       map.set(k, { ...newer, amount: amt, _ids: [...(cur._ids || []), p.id] });
     }
   }
@@ -95,21 +104,45 @@ const getExpenseDesc = (e) => {
 
 /* ========== Period helpers ========== */
 const ymNow = period; // YYYY-MM
+
 const ymFromISO = (iso) => {
   if (!iso) return ymNow;
   const s = String(iso).slice(0, 7);
   return /^\d{4}-\d{2}$/.test(s) ? s : ymNow;
 };
+
+// ¿La fecha (YYYY-MM-DD) pertenece al mes actual?
+const isInCurrentMonth = (iso) => {
+  if (!iso) return false;
+  return ymFromISO(iso) === ymNow; // compara "YYYY-MM"
+};
+
+// ¿El Timestamp (Firestore) pertenece al mes actual?
+const isTimestampInCurrentMonth = (ts) => {
+  if (!ts?.toDate) return false;
+  const d = ts.toDate();
+  const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  return ym === ymNow;
+};
+
 const cmpYM = (a, b) => (a === b ? 0 : a < b ? -1 : 1);
 function incYM(ym) {
   let [y, m] = ym.split("-").map(Number);
   m += 1;
   if (m === 13) {
-    m = 1;
-    y += 1;
+    m = 1; y += 1;
   }
   return `${y}-${String(m).padStart(2, "0")}`;
 }
+
+// Diferencia en meses AÑO/MES (ignora el día)
+function monthsSinceInstallYM(installISO, ref = new Date()) {
+  if (!installISO) return 0;
+  const inst = new Date(`${installISO}T00:00:00`);
+  if (Number.isNaN(inst.getTime())) return 0;
+  return (ref.getFullYear() - inst.getFullYear()) * 12 + (ref.getMonth() - inst.getMonth());
+}
+
 // Cargo del mes actual: 0 si es el mes de instalación; desde el siguiente se cobra plan
 function planForYM(c, ym) {
   const plan = Math.max(0, Number(c.plan || 0));
@@ -119,25 +152,19 @@ function planForYM(c, ym) {
   return plan;
 }
 
-/* ===== Helpers para el filtro "Pendiente" (versión sin colisiones) ===== */
-
-// Fecha local YYYY-MM-DD (no UTC shift)
+/* =====  “pendiente” por días (tu semáforo actual) ===== */
 const _todayISO = (d = new Date()) => {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 };
-
 const _daysInMonth = (y, m) => new Date(y, m, 0).getDate();
-
 const _parseYMD = (iso) => {
   if (!iso || typeof iso !== "string") return { y: NaN, m: NaN, d: NaN };
   const [y, m, d] = iso.split("-").map(Number);
   return { y, m, d };
 };
-
-// Diferencia en días (to - from), en base local
 const _diffDays = (fromISO, toISO = _todayISO()) => {
   if (!fromISO) return 0;
   const A = new Date(`${fromISO}T00:00:00`);
@@ -145,11 +172,6 @@ const _diffDays = (fromISO, toISO = _todayISO()) => {
   if (Number.isNaN(A.getTime()) || Number.isNaN(B.getTime())) return 0;
   return Math.floor((B - A) / 86_400_000);
 };
-
-/**
- * Calcula la fecha de cobro del ciclo actual desde la fecha de instalación.
- * Si aún no llega ese día en el mes actual, usa el del mes anterior.
- */
 const _currentDueDateFromInstall = (installISO, refISO = _todayISO()) => {
   if (!installISO) return refISO;
   const { d: dayInstall } = _parseYMD(installISO);
@@ -157,14 +179,11 @@ const _currentDueDateFromInstall = (installISO, refISO = _todayISO()) => {
   if (!Number.isFinite(dayInstall) || !Number.isFinite(y) || !Number.isFinite(m)) {
     return refISO;
   }
-
   const dayThisMonth = Math.min(dayInstall, _daysInMonth(y, m));
   const dueThisMonth = `${y}-${String(m).padStart(2, "0")}-${String(dayThisMonth).padStart(2, "0")}`;
-
-  // Si hoy es antes del vencimiento de este mes -> usar mes anterior
   if (refISO < dueThisMonth) {
     const prev = new Date(`${y}-${String(m).padStart(2, "0")}-01T00:00:00`);
-    prev.setDate(0); // último día del mes anterior
+    prev.setDate(0);
     const py = prev.getFullYear();
     const pm = prev.getMonth() + 1;
     const dayPrev = Math.min(dayInstall, _daysInMonth(py, pm));
@@ -172,31 +191,25 @@ const _currentDueDateFromInstall = (installISO, refISO = _todayISO()) => {
   }
   return dueThisMonth;
 };
-
-/**
- * Devuelve {label, cls} para pintar el badge "PENDIENTE" con color:
- * 0–3 días => verde, 4–7 => amarillo, 8+ => rojo claro
- */
-const pendingBadgeForClient = (client, today = (typeof todayISO === "function" ? todayISO() : _todayISO())) => {
-  // Si ya tienes un due calculado en el cliente, úsalo; si no, dedúcelo
+const pendingBadgeForClient = (
+  client,
+  today = (typeof todayISO === "function" ? todayISO() : _todayISO())
+) => {
   const dueISO =
     client?._dueISO ||
     _currentDueDateFromInstall(
       client?.installDate || client?.installationDate || client?.fechaInstalacion,
       today
     );
-
-  const delta = _diffDays(dueISO, today); // días desde vencimiento
-
-  let cls = "badge-green"; // 0–3
+  const delta = _diffDays(dueISO, today);
+  let cls = "badge-green";
   if (delta >= 4 && delta <= 7) cls = "badge-yellow";
   else if (delta >= 8) cls = "badge-red";
-
   return { label: "PENDIENTE", cls };
 };
 
-/* === Helpers que usa tu lógica mensual (necesarios aquí) === */
-const lastDayOfMonth = (y, m /*1-12*/) => new Date(y, m, 0).getDate();
+/* === Helpers de tu lógica mensual === */
+const lastDayOfMonth = (y, m) => new Date(y, m, 0).getDate();
 function dueReachedThisMonth(fechaInstalacionISO) {
   if (!fechaInstalacionISO) return false;
   const install = new Date(`${fechaInstalacionISO}T00:00:00`);
@@ -209,24 +222,19 @@ function dueReachedThisMonth(fechaInstalacionISO) {
   const due = new Date(y, m - 1, dueDay, 23, 59, 59);
   return today.getTime() >= due.getTime();
 }
-// Arrastre (meses anteriores), EXCLUYENDO el mes de instalación.
 function computeArrears(c, ymNowStr, approvedByClientByPeriod) {
   if (c.exonerado) return 0;
-  if (!c.fechaInstalacion) return 0;            // ← guard clave
-
+  if (!c.fechaInstalacion) return 0;
   const installYM = ymFromISO(c.fechaInstalacion);
   const [y, m] = ymNowStr.split("-").map(Number);
   const prev = `${m === 1 ? y - 1 : y}-${String(m === 1 ? 12 : m - 1).padStart(2, "0")}`;
-
   const start = incYM(installYM);
   if (cmpYM(start, prev) > 0) return 0;
-
   let theoretical = 0;
   for (let ym = start; ; ym = incYM(ym)) {
     theoretical += planForYM(c, ym);
     if (ym === prev) break;
   }
-
   let approved = 0;
   const perMap = approvedByClientByPeriod.get(c.id);
   if (perMap) {
@@ -236,7 +244,6 @@ function computeArrears(c, ymNowStr, approvedByClientByPeriod) {
   }
   return Math.max(theoretical - approved, 0);
 }
-
 
 /* ====== BALANCE (helpers de fecha) ====== */
 const startOfThisMonth = () => {
@@ -248,16 +255,40 @@ const startOfTomorrow = () => {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0);
 };
 
-/* ===== Util para mostrar fecha de fila: usa batchDate + hora de createdAt ===== */
+/* ===== Util para mostrar fecha de fila ===== */
 function formatRowDateTime(p) {
   const datePart =
     typeof p.batchDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(p.batchDate)
       ? p.batchDate
-      : (p.createdAt?.toDate
-          ? p.createdAt.toDate().toISOString().slice(0, 10)
-          : "—");
+      : p.createdAt?.toDate
+      ? p.createdAt.toDate().toISOString().slice(0, 10)
+      : "—";
   const timePart = p.createdAt?.toDate ? p.createdAt.toDate().toLocaleTimeString() : "—";
   return `${datePart} ${timePart}`;
+}
+
+/* ======= NUEVO: meses vencidos por fecha de instalación ======= */
+/**
+ * Devuelve cuántos "aniversarios mensuales" de la instalación ya se cumplieron
+ * (1 => mes pasado ya llegó el día de corte; 2 => hace dos meses o más, etc).
+ * Si aún no llega el día de corte del mes actual, no cuenta ese mes.
+ */
+function monthsPastAnniversaries(installISO, ref = new Date()) {
+  if (!installISO) return 0;
+  const inst = new Date(`${installISO}T00:00:00`);
+  if (Number.isNaN(inst.getTime())) return 0;
+  if (ref < inst) return 0;
+
+  // meses totales entre años/meses
+  const totalMonths =
+    (ref.getFullYear() - inst.getFullYear()) * 12 +
+    (ref.getMonth() - inst.getMonth());
+
+  // si aún NO llegó el día de corte en este mes, resta 1
+  const reachedCutThisMonth = ref.getDate() >= inst.getDate();
+  const months = totalMonths - (reachedCutThisMonth ? 0 : 1);
+
+  return Math.max(0, months);
 }
 
 export default function AdminPanel() {
@@ -273,8 +304,8 @@ export default function AdminPanel() {
   /* ===== Data ===== */
   const [clients, setClients] = useState([]);
   const [commentsInbox, setCommentsInbox] = useState([]);
-  const [approvedAll, setApprovedAll] = useState([]);   // ← ahora CONSOLIDADO
-  const [submittedAll, setSubmittedAll] = useState([]); // ← CONSOLIDADO
+  const [approvedAll, setApprovedAll] = useState([]);
+  const [submittedAll, setSubmittedAll] = useState([]);
 
   /* ===== Filtros ===== */
   const [filterEstado, setFilterEstado] = useState("Todos");
@@ -286,13 +317,18 @@ export default function AdminPanel() {
   const [openRows, setOpenRows] = useState({});
   const [bellOpen, setBellOpen] = useState(false);
   const [paymentsOpen, setPaymentsOpen] = useState(false);
-  const [submittedCount, setSubmittedCount] = useState(0); // ← consolidado
+  const [submittedCount, setSubmittedCount] = useState(0);
 
   /* ===== Edit ===== */
   const [editId, setEditId] = useState(null);
   const [editData, setEditData] = useState({
-    nombre: "", telefono: "", fechaInstalacion: "", pon: "", plan: "",
-    domicilio: "", exonerado: false,
+    nombre: "",
+    telefono: "",
+    fechaInstalacion: "",
+    pon: "",
+    plan: "",
+    domicilio: "",
+    exonerado: false,
   });
 
   const ponRef = useRef(null);
@@ -302,15 +338,13 @@ export default function AdminPanel() {
   /* ===== BALANCE (UI y estado) ===== */
   const [monthOpen, setMonthOpen] = useState(false);
   const monthRef = useRef(null);
-
   const [mApprovedSum, setMApprovedSum] = useState(0);
   const [mApprovedCount, setMApprovedCount] = useState(0);
   const [mExpensesSum, setMExpensesSum] = useState(0);
   const [mExpensesCount, setMExpensesCount] = useState(0);
-
   // balance por día
   const [balanceDate, setBalanceDate] = useState(todayISO());
-  const [bDayPaySubmitted, setBDayPaySubmitted] = useState(0); // ← consolidado A∪B
+  const [bDayPaySubmitted, setBDayPaySubmitted] = useState(0);
   const [bDayPayApproved, setBDayPayApproved] = useState(0);
   const [bDayExpenses, setBDayExpenses] = useState(0);
 
@@ -323,6 +357,47 @@ export default function AdminPanel() {
   const [listGroups, setListGroups] = useState([]);
 
   const currentUserEmail = auth.currentUser?.email || "admin@capcorp.com";
+
+  /* === Admin de cobradores === */
+  const [collectorsOpen, setCollectorsOpen] = useState(false);
+  const collectorsRef = useRef(null);
+  const [collectors, setCollectors] = useState([]);
+  const [editAliases, setEditAliases] = useState({});
+  const [savingCollectorId, setSavingCollectorId] = useState(null);
+  const [newCollectorEmail, setNewCollectorEmail] = useState("");
+  const [newCollectorAlias, setNewCollectorAlias] = useState("");
+
+  async function saveCollectorAlias(id, alias) {
+    try {
+      setSavingCollectorId(id);
+      await updateDoc(doc(db, "users", id), {
+        alias: String(alias || "").trim(),
+        updatedAt: serverTimestamp(),
+        updatedBy: currentUserEmail,
+      });
+    } finally {
+      setSavingCollectorId(null);
+    }
+  }
+  async function createCollector() {
+    const email = newCollectorEmail.trim().toLowerCase();
+    const alias = newCollectorAlias.trim();
+    if (!/^[^@]+@[^@]+\.[^@]+$/.test(email)) return alert("Correo inválido");
+    if (!alias) return alert("Alias requerido");
+    await addDoc(collection(db, "users"), {
+      role: "collector",
+      email,
+      alias,
+      displayName: alias,
+      createdAt: serverTimestamp(),
+      createdBy: currentUserEmail,
+      updatedAt: serverTimestamp(),
+      updatedBy: currentUserEmail,
+    });
+    setNewCollectorEmail("");
+    setNewCollectorAlias("");
+    alert("Cobrador creado ✅");
+  }
 
   /* ========= SUSCRIPCIONES ========= */
   // Clients
@@ -349,7 +424,7 @@ export default function AdminPanel() {
       const raw = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
       const grouped = consolidatePayments(raw);
       setSubmittedAll(grouped);
-      setSubmittedCount(grouped.length); // badge con consolidación
+      setSubmittedCount(grouped.length);
     });
   }, []);
 
@@ -366,7 +441,11 @@ export default function AdminPanel() {
         setCommentsInbox(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       },
       () => {
-        const q2 = query(collection(db, "comments"), orderBy("createdAt", "desc"), limit(200));
+        const q2 = query(
+          collection(db, "comments"),
+          orderBy("createdAt", "desc"),
+          limit(200)
+        );
         unsub = onSnapshot(q2, (snap2) => {
           const all = snap2.docs.map((d) => ({ id: d.id, ...d.data() }));
           setCommentsInbox(all.filter((c) => c.read !== true));
@@ -376,28 +455,33 @@ export default function AdminPanel() {
     return () => unsub && unsub();
   }, []);
 
-  // Cobradores (labels) con fallback a payments
+  // Cobradores (labels) con fallback a payments + lista editable
   useEffect(() => {
     const qUsers = query(collection(db, "users"), where("role", "==", "collector"));
     let unsubPayments = null;
+
     const unsubUsers = onSnapshot(
       qUsers,
       (snap) => {
         const emails = [];
         const labels = new Map();
+        const arr = [];
         snap.forEach((d) => {
           const u = d.data() || {};
           const email = String(u.email || "").trim();
           if (!email) return;
+          const alias = String(u.alias || u.displayName || u.name || "").trim();
           emails.push(email);
-          const lbl = String(u.alias || u.displayName || u.name || "").trim();
-          labels.set(email, lbl || email);
+          labels.set(email, alias || email);
+          arr.push({ id: d.id, email, alias, displayName: u.displayName || u.name || "" });
         });
         emails.sort((a, b) => {
           const la = labels.get(a) || COLLECTOR_ALIASES[a] || a;
           const lb = labels.get(b) || COLLECTOR_ALIASES[b] || b;
           return la.localeCompare(lb);
         });
+        arr.sort((a, b) => (a.alias || a.email).localeCompare(b.alias || b.email));
+        setCollectors(arr);
         setCollectorLabels(labels);
         setCollectorOptions(["Todos", ...emails]);
       },
@@ -419,16 +503,20 @@ export default function AdminPanel() {
           const labels = new Map(emails.map((e) => [e, COLLECTOR_ALIASES[e] || e]));
           setCollectorLabels(labels);
           setCollectorOptions(["Todos", ...emails]);
+          setCollectors([]); // sin docs de users no podemos editar
         });
       }
     );
+
     return () => {
       unsubUsers && unsubUsers();
       unsubPayments && unsubPayments();
     };
   }, []);
 
-  // Cerrar popovers
+  // Cerrar popovers al click afuera
+  const fixRef = useRef(null);
+  const [fixOpen, setFixOpen] = useState(false);
   useEffect(() => {
     function onClick(e) {
       if (ponOpen && ponRef.current && !ponRef.current.contains(e.target)) {
@@ -443,10 +531,16 @@ export default function AdminPanel() {
       if (paymentsOpen && paymentsRef.current && !paymentsRef.current.contains(e.target)) {
         setPaymentsOpen(false);
       }
+      if (collectorsOpen && collectorsRef.current && !collectorsRef.current.contains(e.target)) {
+        setCollectorsOpen(false);
+      }
+      if (fixOpen && fixRef.current && !fixRef.current.contains(e.target)) {
+        setFixOpen(false);
+      }
     }
     document.addEventListener("mousedown", onClick);
     return () => document.removeEventListener("mousedown", onClick);
-  }, [ponOpen, bellOpen, monthOpen, paymentsOpen]);
+  }, [ponOpen, bellOpen, monthOpen, paymentsOpen, collectorsOpen, fixOpen]);
 
   /* ===== Derivados: pagos por cliente / período ===== */
   const approvedByClientByPeriod = useMemo(() => {
@@ -488,76 +582,95 @@ export default function AdminPanel() {
     return m;
   }, [approvedAll]);
 
-  /* ===== Decorado clientes ===== */
+  /* ===== Decorado clientes (incluye NUEVO monthsDue + badge) ===== */
   const decorated = useMemo(() => {
-    return clients.map((c) => {
-      const plan = Math.max(0, Number(c.plan || 0));
-      const planMes = planForYM(c, ymNow);
-      const aprobadoMes = (approvedByClientByPeriod.get(c.id)?.get(ymNow) || 0);
-      const submittedMes = (submittedByClientByPeriod.get(c.id)?.get(ymNow) || 0);
+  return clients.map((c) => {
+    const plan = Math.max(0, Number(c.plan || 0));
+    const planMes = planForYM(c, ymNow);
+    const aprobadoMes = approvedByClientByPeriod.get(c.id)?.get(ymNow) || 0;
+    const submittedMes = submittedByClientByPeriod.get(c.id)?.get(ymNow) || 0;
 
-      const saldoMes = Math.max(planMes - aprobadoMes, 0); // <- solo aprobados
-      const saldoMesAfterSubmitted = Math.max(planMes - aprobadoMes - submittedMes, 0);
+    const saldoMes = Math.max(planMes - aprobadoMes, 0);
+    const saldoMesAfterSubmitted = Math.max(planMes - aprobadoMes - submittedMes, 0);
 
-      const arrears = computeArrears(c, ymNow, approvedByClientByPeriod);
-      const dueReached = dueReachedThisMonth(c.fechaInstalacion);
+    const arrears = computeArrears(c, ymNow, approvedByClientByPeriod);
+    const dueReached = dueReachedThisMonth(c.fechaInstalacion);
+    const estado = c.exonerado ? "EXONERADO" : (saldoMes <= 0 ? "PAGADO" : "PENDIENTE");
 
-      const estado = c.exonerado ? "EXONERADO" : (saldoMes <= 0 ? "PAGADO" : "PENDIENTE"); // <- aquí
+    // 👉 "Nuevo este mes": creado este mes (fallback a instalación si no hay createdAt)
+    let isNew = isTimestampInCurrentMonth(c.createdAt);
+    if (!c.createdAt && isInCurrentMonth(c.fechaInstalacion)) isNew = true;
 
-      return {
-        ...c,
-        plan,
-        planMes,
-        aprobadoMes,
-        submittedMes,
-        saldoMes,
-        saldoMesAfterSubmitted,
-        estado,
-        arrears,
-        dueReached,
-        lastPaidPeriod: lastPaidPeriodByClient.get(c.id) || "",
-      };
-    });
-  }, [clients, approvedByClientByPeriod, submittedByClientByPeriod, lastPaidPeriodByClient]);
+    // Solo para NUEVOS calculo meses por instalación, ignorando el día.
+    const monthsNewYM = isNew ? monthsSinceInstallYM(c.fechaInstalacion) : 0;
 
-  /* ===== PON list ===== */
-  const ponList = useMemo(() => {
-    const set = new Set();
-    for (const c of clients) {
-      const v = String(c.pon ?? "").trim();
-      if (v) set.add(v);
+    // Badge visual (prioridad: arrears > 0 ⇒ rojo)
+    let badge = null;
+    if (!c.exonerado && saldoMes > 0) {
+      if (arrears > 0) {
+        badge = { label: "PENDIENTE", cls: "badge-red" };           // Debe meses anteriores
+      } else if (isNew) {
+        if (monthsNewYM >= 2) badge = { label: "PENDIENTE", cls: "badge-red" };   // p.ej. instalación agosto en octubre
+        else if (monthsNewYM === 1) badge = { label: "PENDIENTE", cls: "badge-yellow" }; // instalación mes pasado
+      }
+      // Si no es nuevo y no hay arrears, el color por días se maneja en el render con pendingBadgeForClient
     }
-    return ["Todos", ...Array.from(set).sort((a, b) => a.localeCompare(b))];
-  }, [clients]);
 
-  /* ===== Filtros ===== */
+    return {
+      ...c,
+      plan,
+      planMes,
+      aprobadoMes,
+      submittedMes,
+      saldoMes,
+      saldoMesAfterSubmitted,
+      estado,
+      arrears,
+      dueReached,
+      lastPaidPeriod: lastPaidPeriodByClient.get(c.id) || "",
+      // Nuevos:
+      isNew,
+      monthsNewYM,
+      badge,
+    };
+  });
+}, [clients, approvedByClientByPeriod, submittedByClientByPeriod, lastPaidPeriodByClient]);
+
+
+
+  /* ===== Filtros / contadores (incluyen monthsDue) ===== */
   const counts = useMemo(() => {
     let todos = 0, pend = 0, paga = 0, exon = 0;
     for (const c of decorated) {
       const inPon = (ponSel === "Todos") || String(c.pon ?? "") === ponSel;
-      const inSearch = !search.trim() || (c.nombre || "")
-        .toUpperCase().includes(search.trim().toUpperCase());
+      const inSearch =
+        !search.trim() || (c.nombre || "").toUpperCase().includes(search.trim().toUpperCase());
       if (!inPon || !inSearch) continue;
+
       todos += 1;
       if (c.exonerado) {
         exon += 1;
-      } else if (c.saldoMes <= 0) {     // <- pagado
+      } else if (c.saldoMes <= 0) {
         paga += 1;
       } else {
-        pend += 1;
+        const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
+        const isPendingByInstall = (!c.exonerado && c.saldoMes > 0 && c.monthsDue >= 1);
+        if (isPendingNormal || isPendingByInstall) pend += 1;
       }
     }
     return { todos, pend, paga, exon };
   }, [decorated, ponSel, search]);
 
-  // === Filas visibles (usa SOLO saldo aprobado: saldoMes) ===
   const visibles = useMemo(() => {
     let arr = decorated;
 
     if (filterEstado === "Pendiente") {
-      arr = arr.filter(
-        (c) => !c.exonerado && (c.arrears > 0 || (c.dueReached && c.saldoMes > 0))
-      );
+      arr = arr.filter((c) => {
+        if (c.exonerado) return false;
+        const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
+        const isPendingByInstall = (c.saldoMes > 0 && c.monthsDue >= 1);
+        return isPendingNormal || isPendingByInstall;
+      });
     } else if (filterEstado === "Pagado") {
       arr = arr.filter((c) => !c.exonerado && c.saldoMes <= 0);
     } else if (filterEstado === "Exonerado") {
@@ -570,17 +683,17 @@ export default function AdminPanel() {
 
     const q = (search || "").trim().toUpperCase();
     if (q) arr = arr.filter((c) => (c.nombre || "").toUpperCase().includes(q));
-
     return arr;
   }, [decorated, filterEstado, ponSel, search]);
 
-  // === Mapa de nombres por id (para CSV y listas) ===
   const clientNameById = useMemo(() => {
     const m = new Map();
     for (const c of clients) m.set(c.id, c.nombre || c.id);
     return m;
   }, [clients]);
 
+  /* ======== (La UI completa viene en la PARTE 2) ======== */
+  // --- Aquí termina la PARTE 1 ---
   /* ===== Acciones campana ===== */
   async function markCommentRead(id) {
     await updateDoc(doc(db, "comments", id), {
@@ -648,7 +761,7 @@ export default function AdminPanel() {
 
   const toggleInfo = (id) => setOpenRows((prev) => ({ ...prev, [id]: !prev[id] }));
 
-  /* ===== Registro de cliente ===== */
+  /* ===== Registro / edición / eliminar cliente ===== */
   async function handleRegister(e) {
     e?.preventDefault();
     const nombreOk = (nombre || "").trim();
@@ -662,9 +775,8 @@ export default function AdminPanel() {
     if (!isValidPlan(planStr)) {
       return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
     }
-    if (!ponForm) {
-      return alert("Selecciona un PON.");
-    }
+    if (!ponForm) return alert("Selecciona un PON.");
+
     const planOk = Number(planStr);
     await addDoc(collection(db, "clients"), {
       active: true,
@@ -694,8 +806,6 @@ export default function AdminPanel() {
     setDomicilio("");
     setExoneradoForm(false);
   }
-
-  /* ===== Edición por cliente ===== */
   function startEdit(c) {
     setEditId(c.id);
     setEditData({
@@ -724,15 +834,10 @@ export default function AdminPanel() {
     const ponOk = String(editData.pon || "").trim();
     if (!nombreOk) return alert("Nombre es requerido");
     if (!editData.fechaInstalacion) return alert("Fecha de instalación es requerida");
-    if (!isValidPhone(telDigits)) {
-      return alert("Teléfono inválido. Debe tener 10 dígitos y comenzar con 09.");
-    }
-    if (!isValidPlan(planStr)) {
-      return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
-    }
-    if (!ponOk) {
-      return alert("Selecciona un PON.");
-    }
+    if (!isValidPhone(telDigits)) return alert("Teléfono inválido. Debe iniciar con 09 y tener 10 dígitos");
+    if (!isValidPlan(planStr)) return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
+    if (!ponOk) return alert("Selecciona un PON.");
+
     await updateDoc(doc(db, "clients", id), {
       nombre: nombreOk,
       telefono: telDigits,
@@ -747,8 +852,6 @@ export default function AdminPanel() {
     cancelEdit();
     alert("Cliente actualizado ✅");
   }
-
-  /* ===== Eliminar cliente ===== */
   async function handleDelete(c) {
     const ps = await getDocs(query(collection(db, "payments"), where("clientId", "==", c.id)));
     const count = ps.size;
@@ -767,7 +870,7 @@ export default function AdminPanel() {
     alert("Cliente eliminado.");
   }
 
-  /* ===== Cobro (FIFO) ===== */
+  /* ===== Cobro (FIFO) y revertir ===== */
   async function handleCharge(c) {
     if (c.exonerado) {
       alert("Cliente exonerado: no se puede registrar cobros.");
@@ -779,8 +882,8 @@ export default function AdminPanel() {
     while (true) {
       const planMes = planForYM(c, ym);
       if (planMes > 0) {
-        const ap = (approvedByClientByPeriod.get(c.id)?.get(ym) || 0);
-        const sb = (submittedByClientByPeriod.get(c.id)?.get(ym) || 0);
+        const ap = approvedByClientByPeriod.get(c.id)?.get(ym) || 0;
+        const sb = submittedByClientByPeriod.get(c.id)?.get(ym) || 0;
         if (ap + sb < planMes) {
           targetPeriod = ym;
           break;
@@ -797,8 +900,8 @@ export default function AdminPanel() {
       alert(`El período ${targetPeriod} no genera cargo (instalación).`);
       return;
     }
-    const apMes = (approvedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0);
-    const sbMes = (submittedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0);
+    const apMes = approvedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0;
+    const sbMes = submittedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0;
     const restanteMes = Math.max(planMes - apMes - sbMes, 0);
     if (restanteMes <= 0) {
       alert(`El mes ${targetPeriod} ya está cubierto.`);
@@ -826,12 +929,11 @@ Ingresa monto (<= restante)`,
       status: "submitted",
       createdAt: serverTimestamp(),
       createdBy: currentUserEmail,
-      batchDate: todayISO(),
+      batchDate: todayISO(), // fecha LOCAL del cobro
     });
     alert(`Pago enviado. Aplicado al período ${targetPeriod}.`);
   }
 
-  /* ===== Revertir mes actual ===== */
   async function handleRevertMonth(c) {
     if (
       !confirm(
@@ -872,7 +974,7 @@ Ingresa monto (<= restante)`,
     alert("Reversión aplicada sobre el período actual.");
   }
 
-  /* ===== Listas por fecha (agrupación con A∪B y NETO) ===== */
+  /* ===== Listas por fecha (agrupación A∪B y NETO) ===== */
   function buildGroupsFrom(paymentsRows, expensesRows) {
     const byCollector = new Map();
 
@@ -922,8 +1024,6 @@ Ingresa monto (<= restante)`,
     }
 
     const groups = Array.from(byCollector.values());
-
-    // Orden/derivados
     for (const g of groups) {
       g.items.sort((a, b) => {
         const ta = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 0;
@@ -941,7 +1041,7 @@ Ingresa monto (<= restante)`,
     setListGroups(groups);
   }
 
-  // Carga pagos + gastos según filtros (A ∪ B: batchDate == fecha OR createdAt en día con buffer)
+  // Suscripción cuando se abre "Listas y cobros"
   useEffect(() => {
     if (!listsOpen) return;
 
@@ -962,12 +1062,10 @@ Ingresa monto (<= restante)`,
       buildGroupsFrom(payConsolidated, expUnion);
     };
 
-    // Pagos — A: batchDate == fecha
     const unsubPaymentsA = onSnapshot(
       query(collection(db, "payments"), where("batchDate", "==", dateFilter), orderBy("createdAt", "desc")),
       (snap) => { payA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
     );
-    // Pagos — B: createdAt del día (buffer)
     const unsubPaymentsB = onSnapshot(
       query(
         collection(db, "payments"),
@@ -978,12 +1076,10 @@ Ingresa monto (<= restante)`,
       (snap) => { payB = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
     );
 
-    // Gastos — A: batchDate == fecha
     const unsubExpensesA = onSnapshot(
       query(collection(db, "expenses"), where("batchDate", "==", dateFilter), orderBy("createdAt", "desc")),
       (snap) => { expA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
     );
-    // Gastos — B: createdAt del día (buffer)
     const unsubExpensesB = onSnapshot(
       query(
         collection(db, "expenses"),
@@ -1002,13 +1098,14 @@ Ingresa monto (<= restante)`,
     };
   }, [listsOpen, dateFilter, collectorFilter]);
 
-  /* ===== BALANCE (suscripción cuando está abierto) ===== */
+  /* ===== BALANCE (suscripciones) ===== */
+  const [monthOpenLocal, setMonthOpenLocal] = [monthOpen, setMonthOpen]; // alias para claridad
+
   useEffect(() => {
-    if (!monthOpen) return;
+    if (!monthOpenLocal) return;
     const start = startOfThisMonth();
     const end = startOfTomorrow();
 
-    // Pagos aprobados del mes
     const unsubPays = onSnapshot(
       query(collection(db, "payments"), where("approvedAt", ">=", start), where("approvedAt", "<", end)),
       (snap) => {
@@ -1025,7 +1122,6 @@ Ingresa monto (<= restante)`,
       }
     );
 
-    // Gastos del mes
     const unsubExp = onSnapshot(
       query(collection(db, "expenses"), where("createdAt", ">=", start), where("createdAt", "<", end)),
       (snap) => {
@@ -1044,11 +1140,10 @@ Ingresa monto (<= restante)`,
       unsubPays && unsubPays();
       unsubExp && unsubExp();
     };
-  }, [monthOpen]);
+  }, [monthOpenLocal]);
 
-  // ===== Balance por DÍA (A ∪ B consolidado para pagos enviados; A ∪ B para gastos) =====
   useEffect(() => {
-    if (!monthOpen) return;
+    if (!monthOpenLocal) return;
 
     const start = new Date(balanceDate + "T00:00:00");
     const end = new Date(balanceDate + "T23:59:59.999");
@@ -1068,12 +1163,10 @@ Ingresa monto (<= restante)`,
       setBDayExpenses(sumExp);
     };
 
-    // Pagos enviados con batchDate == balanceDate (A)
     const unsubSubmittedA = onSnapshot(
       query(collection(db, "payments"), where("batchDate", "==", balanceDate)),
       (snap) => { payA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
     );
-    // Pagos creados ese día (buffer) (B)
     const unsubSubmittedB = onSnapshot(
       query(
         collection(db, "payments"),
@@ -1083,7 +1176,6 @@ Ingresa monto (<= restante)`,
       (snap) => { payB = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
     );
 
-    // Aprobados ese día por approvedAt
     const unsubApproved = onSnapshot(
       query(collection(db, "payments"), where("approvedAt", ">=", start), where("approvedAt", "<=", end)),
       (snap) => {
@@ -1096,7 +1188,6 @@ Ingresa monto (<= restante)`,
       }
     );
 
-    // Gastos del día: A (batchDate) y B (createdAt buffer)
     const unsubExpA = onSnapshot(
       query(collection(db, "expenses"), where("batchDate", "==", balanceDate)),
       (snap) => { expA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
@@ -1117,9 +1208,16 @@ Ingresa monto (<= restante)`,
       unsubExpA && unsubExpA();
       unsubExpB && unsubExpB();
     };
-  }, [monthOpen, balanceDate]);
+  }, [monthOpenLocal, balanceDate]);
 
   /* ===== UI ===== */
+  const badgeStyle = (cls) => {
+    if (cls === "badge-red")   return { background: "#fee2e2", color: "#991b1b", border: "1px solid #fecaca" };
+    if (cls === "badge-yellow")return { background: "#fef9c3", color: "#92400e", border: "1px solid #fde68a" };
+    if (cls === "badge-green") return { background: "#dcfce7", color: "#166534", border: "1px solid #bbf7d0" };
+    return { background: "#f1f5f9", color: "#0f172a", border: "1px solid #e2e8f0" };
+  };
+
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 20 }}>
       {/* Encabezado */}
@@ -1140,7 +1238,7 @@ Ingresa monto (<= restante)`,
         </div>
         <h2 style={{ textAlign: "center", margin: 0 }}>CAPCORP</h2>
 
-        {/* DERECHA: BALANCE / Listas / Pagos / Campana */}
+        {/* DERECHA: BALANCE / Listas / Pagos / Correcciones / Cobradores / Campana */}
         <div
           style={{
             display: "flex",
@@ -1235,7 +1333,7 @@ Ingresa monto (<= restante)`,
             )}
           </div>
 
-          {/* LISTAS (botón simple) */}
+          {/* LISTAS */}
           <button onClick={() => setListsOpen((v) => !v)} title="Listas y cobros">
             📋 Listas y cobros
           </button>
@@ -1284,12 +1382,142 @@ Ingresa monto (<= restante)`,
                   overflow: "auto",
                 }}
               >
-                <AdminPayments />
+                <AdminPayments onAction={() => setPaymentsOpen(false)} />
               </div>
             )}
           </div>
 
-          {/* CAMPANA (comentarios) */}
+          {/* CORRECCIONES (popover) */}
+          <div style={{ position: "relative" }} ref={fixRef}>
+            <button onClick={() => setFixOpen(v => !v)} title="Herramientas de corrección">
+              🧰 Correcciones
+            </button>
+            {fixOpen && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "115%",
+                  right: 0,
+                  zIndex: 21,
+                  background: "#fff",
+                  border: "1px solid #ddd",
+                  borderRadius: 10,
+                  boxShadow: "0 10px 24px rgba(0,0,0,.12)",
+                  padding: 12,
+                  width: 1000,
+                  maxWidth: "calc(100vw - 40px)",
+                  maxHeight: "70vh",
+                  overflow: "auto",
+                }}
+              >
+                <AdminFixTool onDone={() => setFixOpen(false)} />
+              </div>
+            )}
+          </div>
+
+          {/* COBRADORES (admin de alias) */}
+          <div style={{ position: "relative" }} ref={collectorsRef}>
+            <button onClick={() => setCollectorsOpen(v => !v)} title="Nombres de cobradores">
+              👤 Cobradores
+            </button>
+            {collectorsOpen && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "115%",
+                  right: 0,
+                  zIndex: 19,
+                  background: "#fff",
+                  border: "1px solid #ddd",
+                  borderRadius: 10,
+                  boxShadow: "0 10px 24px rgba(0,0,0,.12)",
+                  padding: 12,
+                  width: 520,
+                  maxHeight: "70vh",
+                  overflow: "auto",
+                }}
+              >
+                <div style={{ fontWeight: 700, marginBottom: 8 }}>Alias de cobradores</div>
+
+                {collectors.length === 0 ? (
+                  <div style={{ color: "#666", marginBottom: 10 }}>
+                    No hay documentos en <code>users</code> con <code>role="collector"</code>.
+                    Puedes crear uno abajo.
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1fr 1fr auto",
+                      gap: 8,
+                      fontSize: 14,
+                      marginBottom: 10,
+                      alignItems: "center",
+                      fontWeight: 600,
+                    }}
+                  >
+                    <div>Correo</div>
+                    <div>Alias (nombre a mostrar)</div>
+                    <div></div>
+                  </div>
+                )}
+
+                {collectors.map((u) => {
+                  const val = editAliases[u.id] ?? u.alias ?? "";
+                  return (
+                    <div
+                      key={u.id}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "1fr 1fr auto",
+                        gap: 8,
+                        alignItems: "center",
+                        marginBottom: 6,
+                      }}
+                    >
+                      <div style={{ fontSize: 13, color: "#444", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {u.email}
+                      </div>
+                      <input
+                        value={val}
+                        placeholder={u.email}
+                        onChange={(e) => setEditAliases((s) => ({ ...s, [u.id]: e.target.value }))}
+                      />
+                      <button
+                        onClick={() => saveCollectorAlias(u.id, val)}
+                        disabled={savingCollectorId === u.id}
+                      >
+                        Guardar
+                      </button>
+                    </div>
+                  );
+                })}
+
+                {/* Crear nuevo cobrador */}
+                <div style={{ borderTop: "1px dashed #eee", marginTop: 10, paddingTop: 10 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 6 }}>Crear cobrador</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8 }}>
+                    <input
+                      placeholder="correo@dominio.com"
+                      value={newCollectorEmail}
+                      onChange={(e) => setNewCollectorEmail(e.target.value)}
+                    />
+                    <input
+                      placeholder="Alias a mostrar"
+                      value={newCollectorAlias}
+                      onChange={(e) => setNewCollectorAlias(e.target.value)}
+                    />
+                    <button onClick={createCollector}>Crear</button>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
+                    Se guarda en <code>users</code> con <code>role="collector</code> y campo <code>alias</code>.
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* CAMPANA */}
           <div style={{ position: "relative" }} ref={bellRef}>
             <button onClick={() => setBellOpen((v) => !v)} title="Comentarios" style={{ position: "relative" }}>
               🔔
@@ -1367,6 +1595,8 @@ Ingresa monto (<= restante)`,
           </div>
         </div>
       </div>
+{/* Auditoría (rango de fechas, cobrador y PON) */}
+<AuditoriaPagos />
 
       {/* ===== Formulario de registro ===== */}
       <form
@@ -1473,7 +1703,6 @@ Ingresa monto (<= restante)`,
           marginBottom: 10,
         }}
       >
-        {/* Estado con contador */}
         <select
           value={filterEstado}
           onChange={(e) => setFilterEstado(e.target.value)}
@@ -1584,9 +1813,7 @@ Ingresa monto (<= restante)`,
               </select>
             </div>
             <div style={{ textAlign: "right", color: "#666", fontSize: 12 }}>
-              {dateFilter
-                ? `Mostrando listas del ${dateFilter}`
-                : "Elige una fecha para filtrar"}
+              {dateFilter ? `Mostrando listas del ${dateFilter}` : "Elige una fecha para filtrar"}
             </div>
           </div>
 
@@ -1618,9 +1845,7 @@ Ingresa monto (<= restante)`,
                       <div>
                         {colLabel} • {g.count} pago(s) • Total: {money(g.total)}{" "}
                         <span style={{ color: "#666", fontWeight: 400, marginLeft: 8 }}>
-                          {Object.entries(g.statuses)
-                            .map(([s, n]) => `${s}: ${n}`)
-                            .join(" · ")}
+                          {Object.entries(g.statuses).map(([s, n]) => `${s}: ${n}`).join(" · ")}
                         </span>
                         <span style={{ marginLeft: 12 }}>
                           • Gastos: <b>{money(g.expenseTotal)}</b> ({g.expenseCount})
@@ -1681,6 +1906,7 @@ Ingresa monto (<= restante)`,
                               fontWeight: 600,
                               padding: "6px 0",
                               borderBottom: "1px dashed #eee",
+
                             }}
                           >
                             <div>Fecha/hora</div>
@@ -1700,9 +1926,7 @@ Ingresa monto (<= restante)`,
                               }}
                             >
                               <div>
-                                {e.createdAt?.toDate
-                                  ? e.createdAt.toDate().toLocaleString()
-                                  : "—"}
+                                {e.createdAt?.toDate ? e.createdAt.toDate().toLocaleString() : "—"}
                               </div>
                               <div>{getExpenseDesc(e)}</div>
                               <div>{money(e.amount)}</div>
@@ -1750,96 +1974,158 @@ Ingresa monto (<= restante)`,
                 alignItems: "center",
               }}
             >
-              <div style={{ fontWeight: 700 }}>
-                {c.nombre}{" "}
-                <span style={{ color: "#777", fontSize: 12 }}> • PON {String(c.pon ?? "—")}</span>
-                {!!c.alerta && (
-                  <span
-                    style={{
-                      marginLeft: 8,
-                      fontSize: 12,
-                      background: "#fff3cd",
-                      border: "1px solid #ffe69c",
-                      padding: "1px 6px",
-                      borderRadius: 999,
-                    }}
-                    title={c.alerta}
-                  >
-                    Nota
-                  </span>
-                )}
-              </div>
-
-              {/* ESTADO (chips con colores y “no llegó fecha” en lila) */}
-<div>
-  {c.exonerado ? (
-    // EXONERADO -> púrpura
+              {/* NOMBRE + chips (PON / NUEVO / Nota) */}
+{/* COLUMNA 1: NOMBRE + etiquetas */}
+<div
+  style={{
+    fontWeight: 700,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  }}
+>
+  <span style={c.isNew ? { color: "#1d4ed8", fontWeight: 800 } : undefined}>
+  {c.nombre}
+</span>
+ {c.isNew && (
+    // Chip "NUEVO"
     <span
       style={{
-        fontSize: 12,
-        padding: "2px 8px",
+        fontSize: 11,
+        background: "#dcfce7",
+        color: "#166534",
+        border: "1px solid #bbf7d0",
+        padding: "1px 8px",
         borderRadius: 999,
-        marginRight: 8,
-        background: "#f3e8ff",
-        color: "#6b21a8",
-        border: "1px solid #e9d5ff",
-        fontWeight: 700,
-        textTransform: "uppercase",
+        fontWeight: 800,
+        letterSpacing: 0.2,
       }}
+      title="Cliente registrado este mes"
     >
-      EXONERADO
+      NUEVO
     </span>
-  ) : c.saldoMes <= 0 ? (
-    // PAGADO -> azul claro
-    <span
-      style={{
-        fontSize: 12,
-        padding: "2px 8px",
-        borderRadius: 999,
-        marginRight: 8,
-        background: "#e0f2fe",
-        color: "#0369a1",
-        border: "1px solid #bae6fd",
-        fontWeight: 700,
-        textTransform: "uppercase",
-      }}
-    >
-      PAGADO
-    </span>
-  ) : !dueReachedThisMonth(c.fechaInstalacion) ? (
-    // Pendiente pero aún NO llega la fecha -> lila
-    <span
-      style={{
-        fontSize: 12,
-        padding: "2px 8px",
-        borderRadius: 999,
-        marginRight: 8,
-        background: "#f5e8ff",
-        color: "#6b21a8",
-        border: "1px solid #e9d5ff",
-        fontWeight: 700,
-        textTransform: "uppercase",
-      }}
-    >
-      PENDIENTE
-    </span>
-  ) : (
-    // Pendiente con fecha ya alcanzada/vencida -> semáforo (verde/amarillo/rojo)
-    (() => {
-      const { label, cls } = pendingBadgeForClient(c);
-      return (
-        <span className={`badge ${cls}`} style={{ marginRight: 8, textTransform:"uppercase", fontWeight:700 }}>
-          {label}
-        </span>
-      );
-    })()
   )}
 
-  <span>
-    Saldo: <b>{money(c.saldoMes)}</b>
-  </span>
+  {!!c.alerta && (
+    // Chip "Nota"
+    <span
+      style={{
+        fontSize: 12,
+        background: "#fff3cd",
+        border: "1px solid #ffe69c",
+        padding: "1px 6px",
+        borderRadius: 999,
+      }}
+      title={c.alerta}
+    >
+      Nota
+    </span>
+  )}
 </div>
 
+
+              {/* ESTADO */}
+              <div>
+                {c.exonerado ? (
+                  <span
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      marginRight: 8,
+                      background: "#f3e8ff",
+                      color: "#6b21a8",
+                      border: "1px solid #e9d5ff",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    EXONERADO
+                  </span>
+                ) : c.saldoMes <= 0 ? (
+                  <span
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      marginRight: 8,
+                      background: "#e0f2fe",
+                      color: "#0369a1",
+                      border: "1px solid #bae6fd",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    PAGADO
+                  </span>
+                ) : c.badge ? (
+                  // NUEVO: badge por meses vencidos (1 = amarillo, >=2 = rojo)
+                  <span
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      marginRight: 8,
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      ...badgeStyle(c.badge.cls),
+                    }}
+                    title={
+                      c.monthsDue >= 2
+                        ? "Tiene 2 meses o más vencidos desde la instalación"
+                        : "Tiene 1 mes vencido desde la instalación"
+                    }
+                  >
+                    {c.badge.label}
+                  </span>
+                ) : !dueReachedThisMonth(c.fechaInstalacion) ? (
+                  <span
+                    style={{
+                      fontSize: 12,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      marginRight: 8,
+                      background: "#f5e8ff",
+                      color: "#6b21a8",
+                      border: "1px solid #e9d5ff",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    PENDIENTE
+                  </span>
+                ) : (
+                  (() => {
+                    const { label, cls } = pendingBadgeForClient(c);
+                    return (
+                      <span
+                        style={{
+                          fontSize: 12,
+                          padding: "2px 8px",
+                          borderRadius: 999,
+                          marginRight: 8,
+                          fontWeight: 700,
+                          textTransform: "uppercase",
+                          ...badgeStyle(cls),
+                        }}
+                      >
+                        {label}
+                      </span>
+                    );
+                  })()
+                )}
+
+                <span>
+                  Saldo: <b>{money(c.saldoMes)}</b>
+                </span>
+                {c.isNew && c.monthsNewYM > 0 && (
+  <span style={{ marginLeft: 10, fontSize: 12, color: "#6b7280" }}>
+    • {c.monthsNewYM} mes{c.monthsNewYM > 1 ? "es" : ""} vencido{c.monthsNewYM > 1 ? "s" : ""}
+  </span>
+)}
+
+              </div>
 
               <div
                 style={{
