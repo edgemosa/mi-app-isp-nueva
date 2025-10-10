@@ -168,20 +168,27 @@ const computeArrears = (c, ymNowStr, approvedByClientByPeriod) => {
   return Math.max(theoretical - approved, 0);
 };
 
-/* === NUEVOS helpers copiados del Admin para el semáforo === */
-// Diferencia en meses AÑO/MES (ignora el día): aniversarios cumplidos
-function monthsPastAnniversaries(installISO, ref = new Date()) {
+/* === NUEVOS helpers (idénticos a Admin) para “nuevo del mes” === */
+const isInCurrentMonth = (iso) => {
+  if (!iso) return false;
+  const ym = String(iso).slice(0, 7);
+  const now = yyyymm();
+  return ym === now;
+};
+const isTimestampInCurrentMonth = (ts) => {
+  if (!ts?.toDate) return false;
+  const d = ts.toDate();
+  const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  return ym === yyyymm();
+};
+// diferencia en meses AÑO/MES (ignora el día)
+function monthsSinceInstallYM(installISO, ref = new Date()) {
   if (!installISO) return 0;
   const inst = new Date(`${installISO}T00:00:00`);
   if (Number.isNaN(inst.getTime())) return 0;
-  if (ref < inst) return 0;
-  const totalMonths =
-    (ref.getFullYear() - inst.getFullYear()) * 12 +
-    (ref.getMonth() - inst.getMonth());
-  const reachedCutThisMonth = ref.getDate() >= inst.getDate();
-  const months = totalMonths - (reachedCutThisMonth ? 0 : 1);
-  return Math.max(0, months);
+  return (ref.getFullYear() - inst.getFullYear()) * 12 + (ref.getMonth() - inst.getMonth());
 }
+
 const _todayISO = (d = new Date()) => {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -504,13 +511,9 @@ export default function CollectorPanel() {
 
   /* -------- Decoración -------- */
   const decorated = useMemo(() => {
-    const today = new Date();
     return clientes.map((c) => {
       const plan = Math.max(0, Number(c.plan || 0));
       const installYM = ymFromISO(c.fechaInstalacion);
-      const installDate = c.fechaInstalacion
-        ? new Date(`${c.fechaInstalacion}T00:00:00`)
-        : null;
 
       const monthsBillable = Math.max(0, monthsDiffInclusive(installYM, BILLABLE_YM));
       const totalDue = plan * monthsBillable;
@@ -528,17 +531,20 @@ export default function CollectorPanel() {
       const arrears = computeArrears(c, PERIOD, approvedByClientByPeriod);
       const dueReached = dueReachedThisMonth(c.fechaInstalacion);
 
-      const isFutureInstall = installDate ? today < installDate : false;
-      const isDueToday = isExactDueDayThisCycle(c.fechaInstalacion);
+      // === “nuevo del mes” igual que Admin
+      let isNew = isTimestampInCurrentMonth(c.createdAt);
+      if (!c.createdAt && isInCurrentMonth(c.fechaInstalacion)) isNew = true;
+      const monthsNewYM = isNew ? monthsSinceInstallYM(c.fechaInstalacion) : 0;
 
-      // NUEVO: meses vencidos por aniversario (como Admin)
-      const monthsDue = monthsPastAnniversaries(c.fechaInstalacion);
-
-      // NUEVO: badge por meses vencidos (1 = amarillo, >=2 = rojo)
+      // === BADGE igual que Admin
       let badge = null;
       if (!c.exonerado && saldoMes > 0) {
-        if (monthsDue >= 2) badge = { label: "PENDIENTE", cls: "badge-red" };
-        else if (monthsDue === 1) badge = { label: "PENDIENTE", cls: "badge-yellow" };
+        if (arrears > 0) {
+          badge = { label: "PENDIENTE", cls: "badge-red" };
+        } else if (isNew) {
+          if (monthsNewYM >= 2) badge = { label: "PENDIENTE", cls: "badge-red" };
+          else if (monthsNewYM === 1) badge = { label: "PENDIENTE", cls: "badge-yellow" };
+        }
       }
 
       return {
@@ -559,11 +565,11 @@ export default function CollectorPanel() {
 
         arrears,
         dueReached,
-        monthsDue,
-        badge,
 
-        isDueToday,
-        isFutureInstall,
+        // NUEVO para sincronizar con Admin
+        isNew,
+        monthsNewYM,
+        badge,
 
         lastPaidPeriod: lastPaidPeriodByClient.get(c.id) || "",
       };
@@ -601,9 +607,13 @@ export default function CollectorPanel() {
     } else if (filtroEstado === "Pagados") {
       arr = arr.filter((c) => !c.exonerado && c.saldoMesAfterSubmitted <= 0);
     } else if (filtroEstado === "Pendientes") {
-      arr = arr.filter(
-        (c) => !c.exonerado && (c.arrears > 0 || (c.dueReached && c.saldoMes > 0))
-      );
+      // === Igual que Admin
+      arr = arr.filter((c) => {
+        if (c.exonerado) return false;
+        const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
+        const isPendingByInstall = (c.saldoMes > 0 && c.monthsNewYM >= 1);
+        return isPendingNormal || isPendingByInstall;
+      });
     }
 
     if (texto) {
@@ -1144,7 +1154,7 @@ Ingresa monto (<= restante):`,
                     ...badgeStyle(c.badge.cls),
                   }}
                   title={
-                    c.monthsDue >= 2
+                    c.monthsNewYM >= 2
                       ? "Tiene 2 meses o más vencidos desde la instalación"
                       : "Tiene 1 mes vencido desde la instalación"
                   }
@@ -1202,10 +1212,11 @@ Ingresa monto (<= restante):`,
                   </td>
                   <td style={{ padding: "10px 6px" }}>
                     {estadoChip}
-                    Saldo (acum.): {money(c.saldo)}{" "}
-                    {c.isDueToday && c.saldoMes > 0 && (
-                      <span style={{ marginLeft: 8, fontSize: 11, color: "#a40000" }}>
-                        vence hoy
+                    {/* Saldo del mes (igual que Admin) */}
+                    Saldo: {money(c.saldoMes)}{" "}
+                    {c.isNew && c.monthsNewYM > 0 && (
+                      <span style={{ marginLeft: 8, fontSize: 11, color: "#6b7280" }}>
+                        • {c.monthsNewYM} mes{c.monthsNewYM > 1 ? "es" : ""} vencido{c.monthsNewYM > 1 ? "s" : ""}
                       </span>
                     )}
                     {trabajoHoy && (

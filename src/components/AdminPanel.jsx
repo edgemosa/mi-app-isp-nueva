@@ -308,10 +308,14 @@ export default function AdminPanel() {
   const [submittedAll, setSubmittedAll] = useState([]);
 
   /* ===== Filtros ===== */
-  const [filterEstado, setFilterEstado] = useState("Todos");
-  const [ponSel, setPonSel] = useState("Todos");
-  const [ponOpen, setPonOpen] = useState(false);
-  const [search, setSearch] = useState("");
+const [filterEstado, setFilterEstado] = useState("Todos");
+const [ponSel, setPonSel] = useState("Todos");
+const [ponOpen, setPonOpen] = useState(false);
+const [search, setSearch] = useState("");
+
+// 👇 AÑADE ESTA LÍNEA AQUÍ (fuera del JSX)
+const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
+
 
   /* ===== UI ===== */
   const [openRows, setOpenRows] = useState({});
@@ -654,7 +658,8 @@ export default function AdminPanel() {
         paga += 1;
       } else {
         const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
-        const isPendingByInstall = (!c.exonerado && c.saldoMes > 0 && c.monthsDue >= 1);
+        const isPendingByInstall = (!c.exonerado && c.saldoMes > 0 && c.monthsNewYM >= 1);
+
         if (isPendingNormal || isPendingByInstall) pend += 1;
       }
     }
@@ -663,15 +668,15 @@ export default function AdminPanel() {
 
   const visibles = useMemo(() => {
     let arr = decorated;
-
-    if (filterEstado === "Pendiente") {
-      arr = arr.filter((c) => {
-        if (c.exonerado) return false;
-        const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
-        const isPendingByInstall = (c.saldoMes > 0 && c.monthsDue >= 1);
-        return isPendingNormal || isPendingByInstall;
-      });
-    } else if (filterEstado === "Pagado") {
+if (filterEstado === "Pendiente") {
+  arr = arr.filter((c) => {
+    if (c.exonerado) return false;
+    const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
+    const isPendingByInstall = (c.saldoMes > 0 && c.monthsNewYM >= 1);
+    return isPendingNormal || isPendingByInstall;
+  });
+}
+ else if (filterEstado === "Pagado") {
       arr = arr.filter((c) => !c.exonerado && c.saldoMes <= 0);
     } else if (filterEstado === "Exonerado") {
       arr = arr.filter((c) => c.exonerado);
@@ -1726,7 +1731,7 @@ Ingresa monto (<= restante)`,
                 top: "110%",
                 left: 0,
                 background: "#fff",
-                border: "1px solid #ddd",
+                border: "1px solid #362525ff",
                 borderRadius: 8,
                 boxShadow: "0 8px 20px rgba(0,0,0,.12)",
                 minWidth: 200,
@@ -1737,23 +1742,22 @@ Ingresa monto (<= restante)`,
               }}
             >
               {ponList.map((p) => (
-                <div
-                  key={p}
-                  onClick={() => {
-                    setPonSel(p);
-                    setPonOpen(false);
-                  }}
-                  style={{
-                    padding: "6px 10px",
-                    cursor: "pointer",
-                    borderRadius: 6,
-                    fontWeight: ponSel === p ? 700 : 400,
-                    background: ponSel === p ? "#f5f5f5" : "transparent",
-                  }}
-                >
-                  {p}
-                </div>
-              ))}
+  <div
+    key={p}
+    onClick={() => { setPonSel(p); setPonOpen(false); }}
+    style={{
+      padding: "6px 10px",
+      cursor: "pointer",
+      borderRadius: 6,
+      fontWeight: ponSel === p ? 700 : 400,
+      background: ponSel === p ? "#f5f5f5" : "transparent",
+    }}
+  >
+    {p}
+  </div>
+))}
+
+
             </div>
           )}
         </div>
@@ -2071,11 +2075,12 @@ Ingresa monto (<= restante)`,
                       textTransform: "uppercase",
                       ...badgeStyle(c.badge.cls),
                     }}
-                    title={
-                      c.monthsDue >= 2
-                        ? "Tiene 2 meses o más vencidos desde la instalación"
-                        : "Tiene 1 mes vencido desde la instalación"
-                    }
+                   title={
+  c.monthsNewYM >= 2
+    ? "Tiene 2 meses o más vencidos desde la instalación"
+    : "Tiene 1 mes vencido desde la instalación"
+}
+
                   >
                     {c.badge.label}
                   </span>
