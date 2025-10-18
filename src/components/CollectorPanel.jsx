@@ -1,5 +1,5 @@
 // src/components/CollectorPanel.jsx
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, Fragment } from "react";
 import {
   collection,
   query,
@@ -11,6 +11,7 @@ import {
   deleteDoc,
   doc,
   orderBy,
+  writeBatch,
 } from "firebase/firestore";
 import { db, auth } from "../lib/firebase";
 import { signOut } from "firebase/auth";
@@ -23,7 +24,15 @@ const money = (n) =>
 const yyyymm = (d = new Date()) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// ✅ LOCAL, no UTC
+const todayISO = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+
 const currentPeriod = () => yyyymm();
 
 const prevYM = (ym) => {
@@ -47,9 +56,6 @@ const monthsDiffInclusive = (fromYM, toYM) => {
   return diff < 0 ? 0 : diff + 1;
 };
 
-const yyyymmFromDate = (d) =>
-  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-
 const cmpYM = (a, b) => (a === b ? 0 : a < b ? -1 : 1);
 
 const incYM = (ym) => {
@@ -63,22 +69,6 @@ const incYM = (ym) => {
 };
 
 const lastDayOfMonth = (y, m /*1-12*/) => new Date(y, m, 0).getDate();
-
-/** Solo para etiqueta “vence hoy”. */
-const isExactDueDayThisCycle = (fechaInstalacionISO) => {
-  if (!fechaInstalacionISO) return false;
-  const install = new Date(`${fechaInstalacionISO}T00:00:00`);
-  if (Number.isNaN(install.getTime())) return false;
-
-  const today = new Date();
-  if (today < install) return false;
-
-  const y = today.getFullYear();
-  const m = today.getMonth() + 1;
-  const dayInstall = install.getDate();
-  const dueDay = Math.min(dayInstall, lastDayOfMonth(y, m));
-  return today.getDate() === dueDay;
-};
 
 /* ===== Consolidación igual que Admin ===== */
 function paymentKey(p) {
@@ -105,18 +95,6 @@ function consolidatePayments(rows) {
   }
   return Array.from(map.values());
 }
-
-/* ===== Helpers de fecha para listas ===== */
-const isoLocalDate = (d) => {
-  const tz = d.getTimezoneOffset();
-  const local = new Date(d.getTime() - tz * 60 * 1000);
-  return local.toISOString().slice(0, 10);
-};
-const formatBatchDateTime = (p) => {
-  const datePart = p.batchDate || (p.createdAt?.toDate ? isoLocalDate(p.createdAt.toDate()) : "");
-  const timePart = p.createdAt?.toDate?.().toLocaleTimeString?.() || "";
-  return (datePart && timePart) ? `${datePart} ${timePart}` : (datePart || "—");
-};
 
 /* ======= MISMO cálculo que Admin ======= */
 const dueReachedThisMonth = (fechaInstalacionISO) => {
@@ -145,7 +123,11 @@ const planForYM = (client, ym) => {
 
 const computeArrears = (c, ymNowStr, approvedByClientByPeriod) => {
   if (c.exonerado) return 0;
+  if (!c.fechaInstalacion) return 0;
   const installYM = ymFromISO(c.fechaInstalacion);
+  if (!installYM) return 0;
+  if (!ymNowStr || !/^\d{4}-\d{2}$/.test(ymNowStr)) return 0;
+
   const [y, m] = ymNowStr.split("-").map(Number);
   const prev = `${m === 1 ? y - 1 : y}-${String(m === 1 ? 12 : m - 1).padStart(2, "0")}`;
 
@@ -168,6 +150,35 @@ const computeArrears = (c, ymNowStr, approvedByClientByPeriod) => {
   return Math.max(theoretical - approved, 0);
 };
 
+/* === Meses ANTES de PERIOD impagos (approved + submitted) === */
+function monthsUnpaidBeforeCurrent(
+  c,
+  ymNowStr,
+  approvedByClientByPeriod,
+  submittedByClientByPeriod
+) {
+  if (!c?.fechaInstalacion) return 0;
+  const installYM = ymFromISO(c.fechaInstalacion);
+  if (!installYM) return 0;
+
+  const start = incYM(installYM);
+  const [y, m] = ymNowStr.split("-").map(Number);
+  const prev = `${m === 1 ? y - 1 : y}-${String(m === 1 ? 12 : m - 1).padStart(2, "0")}`;
+  if (cmpYM(start, prev) > 0) return 0;
+
+  let count = 0;
+  for (let ym = start; ; ym = incYM(ym)) {
+    const planMes = planForYM(c, ym);
+    if (planMes > 0) {
+      const apMes = approvedByClientByPeriod.get(c.id)?.get(ym) || 0;
+      const sbMes = submittedByClientByPeriod.get(c.id)?.get(ym) || 0;
+      if (apMes + sbMes < planMes) count += 1;
+    }
+    if (ym === prev) break;
+  }
+  return count;
+}
+
 /* === NUEVOS helpers (idénticos a Admin) para “nuevo del mes” === */
 const isInCurrentMonth = (iso) => {
   if (!iso) return false;
@@ -181,13 +192,6 @@ const isTimestampInCurrentMonth = (ts) => {
   const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   return ym === yyyymm();
 };
-// diferencia en meses AÑO/MES (ignora el día)
-function monthsSinceInstallYM(installISO, ref = new Date()) {
-  if (!installISO) return 0;
-  const inst = new Date(`${installISO}T00:00:00`);
-  if (Number.isNaN(inst.getTime())) return 0;
-  return (ref.getFullYear() - inst.getFullYear()) * 12 + (ref.getMonth() - inst.getMonth());
-}
 
 const _todayISO = (d = new Date()) => {
   const y = d.getFullYear();
@@ -531,48 +535,57 @@ export default function CollectorPanel() {
       const arrears = computeArrears(c, PERIOD, approvedByClientByPeriod);
       const dueReached = dueReachedThisMonth(c.fechaInstalacion);
 
-      // === “nuevo del mes” igual que Admin
+      // === “nuevo del mes” (igual que Admin)
       let isNew = isTimestampInCurrentMonth(c.createdAt);
       if (!c.createdAt && isInCurrentMonth(c.fechaInstalacion)) isNew = true;
-      const monthsNewYM = isNew ? monthsSinceInstallYM(c.fechaInstalacion) : 0;
 
-      // === BADGE igual que Admin
-      let badge = null;
-      if (!c.exonerado && saldoMes > 0) {
-        if (arrears > 0) {
-          badge = { label: "PENDIENTE", cls: "badge-red" };
-        } else if (isNew) {
-          if (monthsNewYM >= 2) badge = { label: "PENDIENTE", cls: "badge-red" };
-          else if (monthsNewYM === 1) badge = { label: "PENDIENTE", cls: "badge-yellow" };
-        }
-      }
+      // Meses ANTERIORES realmente impagos
+      const monthsUnpaidBefore = monthsUnpaidBeforeCurrent(
+        c, PERIOD, approvedByClientByPeriod, submittedByClientByPeriod
+      );
+
+      // Mostrar contador sólo si este mes aún tiene saldo y es “nuevo”
+      const monthsOverdue = (!c.exonerado && saldoMes > 0 && isNew) ? monthsUnpaidBefore : 0;
+
+     // Badge por meses vencidos previos: rojo con ≥1
+let badge = null;
+if (!c.exonerado && saldoMes > 0) {
+  if (monthsUnpaidBefore >= 1) {
+    badge = { label: "PENDIENTE", cls: "badge-red" };
+  }
+}
+
 
       return {
-        ...c,
-        plan,
-        monthsBillable,
-        totalDue,
-        aprobado: aprobadoHist,
-        submitted: enviadoHist,
-        saldo,
-        saldoAfterSubmitted,
+  ...c,
+  plan,
+  monthsBillable,
+  totalDue,
+  aprobado: aprobadoHist,
+  submitted: enviadoHist,
+  saldo,
+  saldoAfterSubmitted,
 
-        planMes,
-        aprobadoMes: apMes,
-        submittedMes: sbMes,
-        saldoMes,
-        saldoMesAfterSubmitted,
+  planMes,
+  aprobadoMes: apMes,
+  submittedMes: sbMes,
+  saldoMes,
+  saldoMesAfterSubmitted,
 
-        arrears,
-        dueReached,
+  arrears,
+  dueReached,
 
-        // NUEVO para sincronizar con Admin
-        isNew,
-        monthsNewYM,
-        badge,
+  isNew,
 
-        lastPaidPeriod: lastPaidPeriodByClient.get(c.id) || "",
-      };
+  // 👉 ambas
+  monthsUnpaidBefore,
+  monthsOverdue,
+
+  badge,
+
+  lastPaidPeriod: lastPaidPeriodByClient.get(c.id) || "",
+};
+
     });
   }, [
     clientes,
@@ -607,15 +620,21 @@ export default function CollectorPanel() {
     } else if (filtroEstado === "Pagados") {
       arr = arr.filter((c) => !c.exonerado && c.saldoMesAfterSubmitted <= 0);
     } else if (filtroEstado === "Pendientes") {
-      // === Igual que Admin
+      // Igual que Admin:
+      // - Con morosidad histórica (arrears)      -> pendiente
+      // - Ya pasó el día de corte y hay saldo    -> pendiente
+      // - Nuevo del mes con saldo (antes corte)  -> pendiente
+      // - Instalados con meses previos vencidos  -> pendiente
       arr = arr.filter((c) => {
         if (c.exonerado) return false;
-        const isPendingNormal = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
-        const isPendingByInstall = (c.saldoMes > 0 && c.monthsNewYM >= 1);
-        return isPendingNormal || isPendingByInstall;
+
+        const isPendingNormal     = c.arrears > 0 || (c.dueReached && c.saldoMes > 0);
+        const isNewPending        = !c.dueReached && c.isNew && c.saldoMes > 0;
+        const isPendingByInstall  = c.saldoMes > 0 && c.monthsOverdue >= 1;
+
+        return isPendingNormal || isNewPending || isPendingByInstall;
       });
     }
-
     if (texto) {
       arr = arr.filter((c) => {
         const n = (c.nombre || "").toLowerCase();
@@ -643,7 +662,8 @@ export default function CollectorPanel() {
       const set = new Set(ponSeleccion.map(String));
       arr = arr.filter((c) => set.has(String(c.pon ?? "")));
     }
-    arr.sort((a, b) => (a.nombre || "").localeCompare(b.nombre || ""));
+    // 🔧 evitar mutar baseSinPON
+    arr = arr.slice().sort((a, b) => (a.nombre || "").localeCompare(b.nombre || ""));
     return arr;
   }, [baseSinPON, ponSeleccion]);
 
@@ -753,8 +773,12 @@ Ingresa monto (<= restante):`,
     const neto = cobrosTrasEnvio - gastosTrasEnvio;
 
     try {
+      // ✅ envío atómico con writeBatch
+      const batch = writeBatch(db);
+
       for (const it of carrito) {
-        await addDoc(collection(db, "payments"), {
+        const ref = doc(collection(db, "payments"));
+        batch.set(ref, {
           clientId: it.clientId,
           amount: Number(it.amount || 0),
           period: PERIOD, // período de la fecha seleccionada
@@ -767,7 +791,8 @@ Ingresa monto (<= restante):`,
         });
       }
       for (const g of gastosPendientes) {
-        await addDoc(collection(db, "expenses"), {
+        const ref = doc(collection(db, "expenses"));
+        batch.set(ref, {
           amount: Number(g.amount || 0),
           note: g.note || "",
           createdAt: serverTimestamp(),
@@ -776,6 +801,8 @@ Ingresa monto (<= restante):`,
           batchId,
         });
       }
+
+      await batch.commit();
 
       setCarrito([]);
       setGastosPendientes([]);
@@ -1099,8 +1126,8 @@ Ingresa monto (<= restante):`,
             const porEnviar = carrito
               .filter((it) => it.clientId === c.id)
               .reduce((s, it) => s + Number(it.amount || 0), 0);
-            const saldoDisponible = Math.max(c.saldoAfterSubmitted - porEnviar, 0);
 
+            const saldoDisponible = Math.max(c.saldoAfterSubmitted - porEnviar, 0);
             const trabajoHoy = (hoyPorCliente[c.id] || 0) > 0 || porEnviar > 0;
 
             // === BADGE sincronizado con Admin ===
@@ -1142,6 +1169,35 @@ Ingresa monto (<= restante):`,
                 </span>
               );
             } else if (c.badge) {
+  // Badge calculado (rojo) según admin
+  estadoChip = (
+    <span
+      style={{
+        fontSize: 12,
+        padding: "2px 8px",
+        borderRadius: 12,
+        marginRight: 8,
+        fontWeight: 700,
+        textTransform: "uppercase",
+        ...badgeStyle(c.badge.cls),
+      }}
+      title={
+  c.monthsUnpaidBefore >= 1
+    ? `Tiene ${c.monthsUnpaidBefore} mes${c.monthsUnpaidBefore>1?"es":""} vencido${c.monthsUnpaidBefore>1?"s":""} (anteriores al actual)`
+    : undefined
+}
+
+    >
+      {c.badge.label}
+    </span>
+  );
+
+            } else if (!c.dueReached) {
+              // Antes del día de corte de este mes:
+              // - Si es cliente NUEVO del mes y tiene saldo -> AMARILLO (igual que Admin)
+              // - Si no, mantener MORADO
+              const isNewPending = c.isNew && c.saldoMes > 0;
+
               estadoChip = (
                 <span
                   style={{
@@ -1151,38 +1207,25 @@ Ingresa monto (<= restante):`,
                     marginRight: 8,
                     fontWeight: 700,
                     textTransform: "uppercase",
-                    ...badgeStyle(c.badge.cls),
+                    ...(isNewPending
+                      ? badgeStyle("badge-yellow") // NUEVO -> amarillo
+                      : {                          // resto -> morado
+                          background: "#f5e8ff",
+                          color: "#6b21a8",
+                          border: "1px solid #e9d5ff",
+                        }),
                   }}
                   title={
-                    c.monthsNewYM >= 2
-                      ? "Tiene 2 meses o más vencidos desde la instalación"
-                      : "Tiene 1 mes vencido desde la instalación"
+                    isNewPending
+                      ? "Nuevo del mes con saldo: pendiente (amarillo)"
+                      : "Aún no llega el día de corte de este mes"
                   }
-                >
-                  {c.badge.label}
-                </span>
-              );
-            } else if (!c.dueReached) {
-              // antes de llegar al día de corte de este mes → morado (como Admin)
-              estadoChip = (
-                <span
-                  style={{
-                    fontSize: 12,
-                    padding: "2px 8px",
-                    borderRadius: 12,
-                    marginRight: 8,
-                    background: "#f5e8ff",
-                    color: "#6b21a8",
-                    border: "1px solid #e9d5ff",
-                    fontWeight: 700,
-                    textTransform: "uppercase",
-                  }}
                 >
                   PENDIENTE
                 </span>
               );
             } else {
-              // semáforo por días desde el vencimiento (verde/amarillo/rojo)
+              // semáforo por días desde el vencimiento
               const { label, cls } = pendingBadgeForClient(c);
               estadoChip = (
                 <span
@@ -1202,21 +1245,42 @@ Ingresa monto (<= restante):`,
             }
 
             return (
-              <>
-                <tr key={c.id} style={{ borderTop: "1px solid #eee" }}>
+              <Fragment key={c.id}>
+                <tr style={{ borderTop: "1px solid #eee" }}>
+                  {/* 1) NOMBRE */}
                   <td style={{ padding: "10px 6px" }}>
                     <b>{c.nombre}</b>{" "}
-                    <span style={{ color: "#777", fontSize: 12 }}>
+                    {/* NUEVO del mes (igual que Admin) */}
+                    {c.isNew && (
+                      <span
+                        title="Instalado este mes"
+                        style={{
+                          marginLeft: 6,
+                          fontSize: 11,
+                          padding: "2px 6px",
+                          borderRadius: 999,
+                          fontWeight: 700,
+                          textTransform: "uppercase",
+                          background: "#dcfce7",
+                          color: "#166534",
+                          border: "1px solid #bbf7d0",
+                        }}
+                      >
+                        NUEVO
+                      </span>
+                    )}
+                    <span style={{ color: "#777", fontSize: 12, marginLeft: 6 }}>
                       PON {String(c.pon ?? "—")} · Plan {money(c.plan || 0)}
                     </span>
                   </td>
+
+                  {/* 2) ESTADO */}
                   <td style={{ padding: "10px 6px" }}>
-                    {estadoChip}
-                    {/* Saldo del mes (igual que Admin) */}
+                    {estadoChip}{" "}
                     Saldo: {money(c.saldoMes)}{" "}
-                    {c.isNew && c.monthsNewYM > 0 && (
+                    {c.monthsOverdue > 0 && (
                       <span style={{ marginLeft: 8, fontSize: 11, color: "#6b7280" }}>
-                        • {c.monthsNewYM} mes{c.monthsNewYM > 1 ? "es" : ""} vencido{c.monthsNewYM > 1 ? "s" : ""}
+                        • {c.monthsOverdue} mes{c.monthsOverdue > 1 ? "es" : ""} vencido{c.monthsOverdue > 1 ? "s" : ""}
                       </span>
                     )}
                     {trabajoHoy && (
@@ -1235,6 +1299,8 @@ Ingresa monto (<= restante):`,
                       </span>
                     )}
                   </td>
+
+                  {/* 3) ACCIONES */}
                   <td style={{ padding: "10px 6px" }}>
                     <button
                       onClick={() => {
@@ -1262,7 +1328,9 @@ Ingresa monto (<= restante):`,
                       title={
                         c.exonerado
                           ? "Cliente exonerado"
-                          : (saldoDisponible > 0 ? "Agregar al lote" : "Sin saldo disponible")
+                          : saldoDisponible > 0
+                          ? "Agregar al lote"
+                          : "Sin saldo disponible"
                       }
                     >
                       Cobrar
@@ -1292,7 +1360,7 @@ Ingresa monto (<= restante):`,
                           return (
                             <ul style={{ paddingLeft: 18, marginTop: 6 }}>
                               {pagos.map((p) => (
-                                <li key={p.id}>
+                                <li key={paymentKey(p)}>
                                   {p.createdAt?.toDate?.().toLocaleString?.() || "…"} · {money(p.amount)} · {p.type || "—"} · <i>{p.status}</i> · Periodo: {p.period}
                                 </li>
                               ))}
@@ -1303,7 +1371,7 @@ Ingresa monto (<= restante):`,
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             );
           })}
         </tbody>
