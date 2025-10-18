@@ -1,30 +1,31 @@
 // src/components/AdminPanel.jsx
-
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { db, auth } from "../lib/firebase";
-import AuditoriaPagos from "./AuditoriaPagos";
 import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  orderBy,
-  addDoc,
-  updateDoc,
-  deleteDoc,
-  doc,
-  serverTimestamp,
-  getDocs,
-  limit,
+  collection, query, where, onSnapshot, orderBy,
+  addDoc, updateDoc, deleteDoc, doc, serverTimestamp,
+  getDocs, limit, writeBatch
 } from "firebase/firestore";
 import { signOut } from "firebase/auth";
+import AuditoriaPagos from "./AuditoriaPagos";
 import AdminPayments from "./AdminPayments";
 import AdminFixTool from "./AdminFixTool";
+import {
+  todayISO,
+  ymFromISO,
+  incYM,
+  prevYM,
+  isInCurrentMonth,
+  isTimestampInCurrentMonth,
+} from "../utils/dates";
+// (opcional) si vas a usar recordatorios en este archivo:
 
 /* ========== Helpers ========== */
 const COLLECTOR_ALIASES = {
   "jeffersonhajajsvsh12@gmail.com": "JEFERSON",
 };
+// Comparar cadenas YYYY-MM: -1 si a<b, 0 si igual, 1 si a>b
+const cmpYM = (a, b) => (a === b ? 0 : (a > b ? 1 : -1));
 
 const labelFromMaps = (email, labelsMap) => {
   if (!email || email === "—") return "—";
@@ -36,20 +37,6 @@ const money = (n) => {
   return `$${x.toFixed(2)}`;
 };
 
-// ✅ Fecha LOCAL (no UTC)
-const todayISO = () => {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-};
-
-const currentPeriod = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-};
-const period = currentPeriod();
 
 const uniqById = (arr) => Array.from(new Map(arr.map((x) => [x.id, x])).values());
 
@@ -67,7 +54,7 @@ function consolidatePayments(rows) {
   const map = new Map();
   for (const p of rows) {
     const k = paymentKey(p);
-    const cur = map.get(k);
+    const cur = map.get(k);                   
     if (!cur) {
       map.set(k, { ...p, amount: Number(p.amount || 0), _ids: [p.id] });
     } else {
@@ -102,37 +89,33 @@ const getExpenseDesc = (e) => {
   return found ? found.trim() : "—";
 };
 
-/* ========== Period helpers ========== */
-const ymNow = period; // YYYY-MM
 
-const ymFromISO = (iso) => {
-  if (!iso) return ymNow;
-  const s = String(iso).slice(0, 7);
-  return /^\d{4}-\d{2}$/.test(s) ? s : ymNow;
-};
+// Meses ANTES del mes actual que no están completos (considera approved + submitted)
+function monthsUnpaidBeforeCurrent(
+  c,
+  ymNowStr,
+  approvedByClientByPeriod,
+  submittedByClientByPeriod
+) {
+  if (!c?.fechaInstalacion) return 0;
+  const installYM = ymFromISO(c.fechaInstalacion);
+  if (!installYM) return 0;                 // ⬅️ nueva guarda
 
-// ¿La fecha (YYYY-MM-DD) pertenece al mes actual?
-const isInCurrentMonth = (iso) => {
-  if (!iso) return false;
-  return ymFromISO(iso) === ymNow; // compara "YYYY-MM"
-};
+  const start = incYM(installYM);
+  const prev  = prevYM(ymNowStr);
+  if (cmpYM(start, prev) > 0) return 0;
 
-// ¿El Timestamp (Firestore) pertenece al mes actual?
-const isTimestampInCurrentMonth = (ts) => {
-  if (!ts?.toDate) return false;
-  const d = ts.toDate();
-  const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  return ym === ymNow;
-};
-
-const cmpYM = (a, b) => (a === b ? 0 : a < b ? -1 : 1);
-function incYM(ym) {
-  let [y, m] = ym.split("-").map(Number);
-  m += 1;
-  if (m === 13) {
-    m = 1; y += 1;
+  let count = 0;
+  for (let ym = start; ; ym = incYM(ym)) {
+    const planMes = planForYM(c, ym);
+    if (planMes > 0) {
+      const apMes = approvedByClientByPeriod.get(c.id)?.get(ym) || 0;
+      const sbMes = submittedByClientByPeriod.get(c.id)?.get(ym) || 0;
+      if (apMes + sbMes < planMes) count += 1;
+    }
+    if (ym === prev) break;
   }
-  return `${y}-${String(m).padStart(2, "0")}`;
+  return count;
 }
 
 // Diferencia en meses AÑO/MES (ignora el día)
@@ -146,9 +129,12 @@ function monthsSinceInstallYM(installISO, ref = new Date()) {
 // Cargo del mes actual: 0 si es el mes de instalación; desde el siguiente se cobra plan
 function planForYM(c, ym) {
   const plan = Math.max(0, Number(c.plan || 0));
-  const installYM = ymFromISO(c.fechaInstalacion);
-  if (ym === installYM) return 0;
-  if (cmpYM(ym, installYM) < 0) return 0;
+  // ⬇️ Fallback seguro: si no hay fecha válida, asumimos el mes de referencia (ym)
+  const installYM = ymFromISO(c.fechaInstalacion, ym);
+
+  if (!installYM) return plan;        // sin fecha, cobra como mes normal
+  if (ym === installYM) return 0;     // mes de instalación no cobra
+  if (cmpYM(ym, installYM) < 0) return 0; // antes de instalación tampoco
   return plan;
 }
 
@@ -165,134 +151,66 @@ const _parseYMD = (iso) => {
   const [y, m, d] = iso.split("-").map(Number);
   return { y, m, d };
 };
-const _diffDays = (fromISO, toISO = _todayISO()) => {
-  if (!fromISO) return 0;
-  const A = new Date(`${fromISO}T00:00:00`);
-  const B = new Date(`${toISO}T00:00:00`);
-  if (Number.isNaN(A.getTime()) || Number.isNaN(B.getTime())) return 0;
-  return Math.floor((B - A) / 86_400_000);
-};
-const _currentDueDateFromInstall = (installISO, refISO = _todayISO()) => {
-  if (!installISO) return refISO;
-  const { d: dayInstall } = _parseYMD(installISO);
-  const { y, m } = _parseYMD(refISO);
-  if (!Number.isFinite(dayInstall) || !Number.isFinite(y) || !Number.isFinite(m)) {
-    return refISO;
-  }
-  const dayThisMonth = Math.min(dayInstall, _daysInMonth(y, m));
-  const dueThisMonth = `${y}-${String(m).padStart(2, "0")}-${String(dayThisMonth).padStart(2, "0")}`;
-  if (refISO < dueThisMonth) {
-    const prev = new Date(`${y}-${String(m).padStart(2, "0")}-01T00:00:00`);
-    prev.setDate(0);
-    const py = prev.getFullYear();
-    const pm = prev.getMonth() + 1;
-    const dayPrev = Math.min(dayInstall, _daysInMonth(py, pm));
-    return `${py}-${String(pm).padStart(2, "0")}-${String(dayPrev).padStart(2, "0")}`;
-  }
-  return dueThisMonth;
-};
-const pendingBadgeForClient = (
-  client,
-  today = (typeof todayISO === "function" ? todayISO() : _todayISO())
-) => {
-  const dueISO =
-    client?._dueISO ||
-    _currentDueDateFromInstall(
-      client?.installDate || client?.installationDate || client?.fechaInstalacion,
-      today
-    );
-  const delta = _diffDays(dueISO, today);
-  let cls = "badge-green";
-  if (delta >= 4 && delta <= 7) cls = "badge-yellow";
-  else if (delta >= 8) cls = "badge-red";
-  return { label: "PENDIENTE", cls };
-};
-
-/* === Helpers de tu lógica mensual === */
-const lastDayOfMonth = (y, m) => new Date(y, m, 0).getDate();
-function dueReachedThisMonth(fechaInstalacionISO) {
-  if (!fechaInstalacionISO) return false;
-  const install = new Date(`${fechaInstalacionISO}T00:00:00`);
-  if (Number.isNaN(install.getTime())) return false;
-  const today = new Date();
-  if (today < install) return false;
-  const y = today.getFullYear();
-  const m = today.getMonth() + 1;
-  const dueDay = Math.min(install.getDate(), lastDayOfMonth(y, m));
-  const due = new Date(y, m - 1, dueDay, 23, 59, 59);
-  return today.getTime() >= due.getTime();
-}
-function computeArrears(c, ymNowStr, approvedByClientByPeriod) {
-  if (c.exonerado) return 0;
-  if (!c.fechaInstalacion) return 0;
-  const installYM = ymFromISO(c.fechaInstalacion);
-  const [y, m] = ymNowStr.split("-").map(Number);
-  const prev = `${m === 1 ? y - 1 : y}-${String(m === 1 ? 12 : m - 1).padStart(2, "0")}`;
-  const start = incYM(installYM);
-  if (cmpYM(start, prev) > 0) return 0;
-  let theoretical = 0;
-  for (let ym = start; ; ym = incYM(ym)) {
-    theoretical += planForYM(c, ym);
-    if (ym === prev) break;
-  }
-  let approved = 0;
-  const perMap = approvedByClientByPeriod.get(c.id);
-  if (perMap) {
-    for (const [per, amt] of perMap.entries()) {
-      if (cmpYM(per, prev) <= 0) approved += Number(amt || 0);
-    }
-  }
-  return Math.max(theoretical - approved, 0);
-}
-
-/* ====== BALANCE (helpers de fecha) ====== */
-const startOfThisMonth = () => {
+// ⬇️ A partir de aquí empieza el componente
+// === Helpers de fecha/hora ===
+function startOfThisMonth() {
   const d = new Date();
   return new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
-};
-const startOfTomorrow = () => {
+}
+function startOfTomorrow() {
   const d = new Date();
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0);
-};
-
-/* ===== Util para mostrar fecha de fila ===== */
-function formatRowDateTime(p) {
-  const datePart =
-    typeof p.batchDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(p.batchDate)
-      ? p.batchDate
-      : p.createdAt?.toDate
-      ? p.createdAt.toDate().toISOString().slice(0, 10)
-      : "—";
-  const timePart = p.createdAt?.toDate ? p.createdAt.toDate().toLocaleTimeString() : "—";
-  return `${datePart} ${timePart}`;
 }
 
-/* ======= NUEVO: meses vencidos por fecha de instalación ======= */
-/**
- * Devuelve cuántos "aniversarios mensuales" de la instalación ya se cumplieron
- * (1 => mes pasado ya llegó el día de corte; 2 => hace dos meses o más, etc).
- * Si aún no llega el día de corte del mes actual, no cuenta ese mes.
- */
-function monthsPastAnniversaries(installISO, ref = new Date()) {
-  if (!installISO) return 0;
-  const inst = new Date(`${installISO}T00:00:00`);
-  if (Number.isNaN(inst.getTime())) return 0;
-  if (ref < inst) return 0;
+// El “día de vencimiento” de cada mes será el día de instalación.
+// Si hoy >= día de instalación => ya alcanzó vencimiento este mes.
+function dueReachedThisMonth(installISO) {
+  if (!installISO) return false;
+  const [ , , d ] = installISO.split("-").map(Number);
+  if (!Number.isFinite(d) || d < 1 || d > 31) return false;
+  return new Date().getDate() >= d;
+}
 
-  // meses totales entre años/meses
-  const totalMonths =
-    (ref.getFullYear() - inst.getFullYear()) * 12 +
-    (ref.getMonth() - inst.getMonth());
 
-  // si aún NO llegó el día de corte en este mes, resta 1
-  const reachedCutThisMonth = ref.getDate() >= inst.getDate();
-  const months = totalMonths - (reachedCutThisMonth ? 0 : 1);
+// Meses en mora (anteriores al mes actual) considerando SOLO aprobados.
+function computeArrears(client, ymNowStr, approvedByClientByPeriod) {
+  const apMap = approvedByClientByPeriod.get(client.id) || new Map();
+ const installYM = ymFromISO(client.fechaInstalacion, ymNowStr);
+if (!installYM) return 0;
 
-  return Math.max(0, months);
+
+  let count = 0;
+  // arrancamos desde el mes siguiente a la instalación y vamos hasta el mes anterior al actual
+  for (let ym = incYM(installYM); cmpYM(ym, prevYM(ymNowStr)) <= 0; ym = incYM(ym)) {
+    const planMes = planForYM(client, ym);
+    if (planMes > 0) {
+      const apMes = apMap.get(ym) || 0;
+      if (apMes < planMes) count += 1;
+    }
+  }
+  return count;
+}
+
+// Badge por pendiente “suave” cuando no aplica el rojo/amarillo previo
+function pendingBadgeForClient(c) {
+  // si hay saldo en el mes actual y ya llegó a su vencimiento mensual → pendiente
+  if (!c.exonerado && c.saldoMes > 0) {
+    return { label: "PENDIENTE", cls: "badge-yellow" };
+  }
+  return { label: "OK", cls: "badge-green" };
+}
+
+// Formato de filas en “Listas y cobros”
+function formatRowDateTime(p) {
+  const ts =
+    (p.createdAt?.toDate?.()) ||
+    (p.approvedAt?.toDate?.()) ||
+    null;
+  return ts ? ts.toLocaleString() : "—";
 }
 
 export default function AdminPanel() {
-  /* ===== Formulario (registro) ===== */
+  /* ===== Formulario ===== */
   const [nombre, setNombre] = useState("");
   const [telefono, setTelefono] = useState("");
   const [fechaInstalacion, setFechaInstalacion] = useState("");
@@ -301,11 +219,47 @@ export default function AdminPanel() {
   const [domicilio, setDomicilio] = useState("");
   const [exoneradoForm, setExoneradoForm] = useState(false);
 
-  /* ===== Data ===== */
+  /* ===== Data (colecciones) ===== */
   const [clients, setClients] = useState([]);
   const [commentsInbox, setCommentsInbox] = useState([]);
   const [approvedAll, setApprovedAll] = useState([]);
   const [submittedAll, setSubmittedAll] = useState([]);
+
+  /* ===== Periodo YYYY-MM (reactivo por día) ===== */
+function getCurrentPeriod() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+const [ymNow, setYmNow] = useState(getCurrentPeriod());
+
+// guardamos aquí el id del setInterval para limpiarlo al desmontar
+const intervalRef = useRef(null);
+
+useEffect(() => {
+  const now = new Date();
+  // próximo cambio de día a las 00:00
+  const nextMidnight = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + 1,
+    0, 0, 0, 0
+  );
+
+  // al llegar a medianoche, actualiza ymNow y luego cada 24h
+  const timeoutId = setTimeout(() => {
+    setYmNow(getCurrentPeriod());
+    intervalRef.current = setInterval(
+      () => setYmNow(getCurrentPeriod()),
+      24 * 60 * 60 * 1000
+    );
+  }, nextMidnight - now);
+
+  // limpieza
+  return () => {
+    clearTimeout(timeoutId);
+    if (intervalRef.current) clearInterval(intervalRef.current);
+  };
+}, []);
 
   /* ===== Filtros ===== */
 const [filterEstado, setFilterEstado] = useState("Todos");
@@ -318,10 +272,13 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
 
 
   /* ===== UI ===== */
-  const [openRows, setOpenRows] = useState({});
-  const [bellOpen, setBellOpen] = useState(false);
-  const [paymentsOpen, setPaymentsOpen] = useState(false);
-  const [submittedCount, setSubmittedCount] = useState(0);
+const [openRows, setOpenRows] = useState({});
+const [bellOpen, setBellOpen] = useState(false);
+const [paymentsOpen, setPaymentsOpen] = useState(false);
+const [submittedCount, setSubmittedCount] = useState(0);
+
+// correo del usuario actual para createdBy/updatedBy
+const currentUserEmail = auth?.currentUser?.email || "system";
 
   /* ===== Edit ===== */
   const [editId, setEditId] = useState(null);
@@ -338,6 +295,8 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
   const ponRef = useRef(null);
   const bellRef = useRef(null);
   const paymentsRef = useRef(null);
+  const fixRef = useRef(null);
+const [fixOpen, setFixOpen] = useState(false);
 
   /* ===== BALANCE (UI y estado) ===== */
   const [monthOpen, setMonthOpen] = useState(false);
@@ -351,16 +310,93 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
   const [bDayPaySubmitted, setBDayPaySubmitted] = useState(0);
   const [bDayPayApproved, setBDayPayApproved] = useState(0);
   const [bDayExpenses, setBDayExpenses] = useState(0);
+/* ===== Revertir mes actual ===== */
+async function handleRevertMonth(c) {
+  const target = ymNow;
 
-  /* ===== Listas por fecha ===== */
-  const [listsOpen, setListsOpen] = useState(false);
-  const [collectorOptions, setCollectorOptions] = useState(["Todos"]);
-  const [collectorLabels, setCollectorLabels] = useState(new Map());
-  const [collectorFilter, setCollectorFilter] = useState("Todos");
-  const [dateFilter, setDateFilter] = useState(todayISO());
-  const [listGroups, setListGroups] = useState([]);
+  if (!confirm(
+    `Revertir pagos del período ${target} para ${c.nombre}?\n- 'approved' → 'reversed'\n- 'submitted' → 'rejected'`
+  )) return;
 
-  const currentUserEmail = auth.currentUser?.email || "admin@capcorp.com";
+  try {
+    const qa = query(
+      collection(db, "payments"),
+      where("clientId", "==", c.id),
+      where("period", "==", target),
+      where("status", "==", "approved")
+    );
+    const sa = await getDocs(qa);
+
+    const qs = query(
+      collection(db, "payments"),
+      where("clientId", "==", c.id),
+      where("period", "==", target),
+      where("status", "==", "submitted")
+    );
+    const ss = await getDocs(qs);
+
+    if (sa.empty && ss.empty) {
+      alert("No hay pagos que revertir para el período actual.");
+      return;
+    }
+
+    const batch = writeBatch(db);
+
+    sa.forEach((d) => {
+      batch.update(doc(db, "payments", d.id), {
+        status: "reversed",
+        updatedAt: serverTimestamp(),
+        updatedBy: currentUserEmail,
+        reversedAt: serverTimestamp(),
+        reversedBy: currentUserEmail,
+        reason: "revert-month",
+      });
+    });
+
+    ss.forEach((d) => {
+      batch.update(doc(db, "payments", d.id), {
+        status: "rejected",
+        updatedAt: serverTimestamp(),
+        updatedBy: currentUserEmail,
+        rejectedAt: serverTimestamp(),
+        rejectedBy: currentUserEmail,
+        reason: "revert-month",
+      });
+    });
+
+    await batch.commit();
+    alert("Reversión aplicada sobre el período actual.");
+  } catch (err) {
+    console.error(err);
+    alert("Error al revertir el período. Revisa la consola para más detalles.");
+  }
+}
+ //* ===== Listas por fecha ===== */
+const [listsOpen, setListsOpen] = useState(false);
+const [collectorOptions, setCollectorOptions] = useState(["Todos"]);
+const [collectorLabels, setCollectorLabels] = useState(new Map());
+const [collectorFilter, setCollectorFilter] = useState("Todos");
+const [dateFilter, setDateFilter] = useState(todayISO());
+
+// estado + persistencia del toggle "Mostrar rechazados"
+// estado + persistencia del toggle "Mostrar rechazados" (SSR-safe)
+const [showRejected, setShowRejected] = useState(false);
+
+useEffect(() => {
+  try {
+    const v = typeof window !== "undefined" && localStorage.getItem("showRejected") === "1";
+    setShowRejected(!!v);
+  } catch {}
+}, []);
+
+useEffect(() => {
+  try {
+    localStorage.setItem("showRejected", showRejected ? "1" : "0");
+  } catch {}
+}, [showRejected]);
+// listas por fecha (grupos por cobrador)
+const [listGroups, setListGroups] = useState([]);
+
 
   /* === Admin de cobradores === */
   const [collectorsOpen, setCollectorsOpen] = useState(false);
@@ -519,32 +555,38 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
   }, []);
 
   // Cerrar popovers al click afuera
-  const fixRef = useRef(null);
-  const [fixOpen, setFixOpen] = useState(false);
-  useEffect(() => {
-    function onClick(e) {
-      if (ponOpen && ponRef.current && !ponRef.current.contains(e.target)) {
-        setPonOpen(false);
-      }
-      if (bellOpen && bellRef.current && !bellRef.current.contains(e.target)) {
-        setBellOpen(false);
-      }
-      if (monthOpen && monthRef.current && !monthRef.current.contains(e.target)) {
-        setMonthOpen(false);
-      }
-      if (paymentsOpen && paymentsRef.current && !paymentsRef.current.contains(e.target)) {
-        setPaymentsOpen(false);
-      }
-      if (collectorsOpen && collectorsRef.current && !collectorsRef.current.contains(e.target)) {
-        setCollectorsOpen(false);
-      }
-      if (fixOpen && fixRef.current && !fixRef.current.contains(e.target)) {
-        setFixOpen(false);
-      }
+useEffect(() => {
+  function onClick(e) {
+    if (ponOpen && ponRef.current && !ponRef.current.contains(e.target)) {
+      setPonOpen(false);
     }
-    document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
-  }, [ponOpen, bellOpen, monthOpen, paymentsOpen, collectorsOpen, fixOpen]);
+    if (bellOpen && bellRef.current && !bellRef.current.contains(e.target)) {
+      setBellOpen(false);
+    }
+    if (monthOpen && monthRef.current && !monthRef.current.contains(e.target)) {
+      setMonthOpen(false);
+    }
+    if (paymentsOpen && paymentsRef.current && !paymentsRef.current.contains(e.target)) {
+      setPaymentsOpen(false);
+    }
+    if (collectorsOpen && collectorsRef.current && !collectorsRef.current.contains(e.target)) {
+      setCollectorsOpen(false);
+    }
+    if (fixOpen && fixRef.current && !fixRef.current.contains(e.target)) {
+      setFixOpen(false);
+    }
+    
+  }
+  document.addEventListener("mousedown", onClick);
+  return () => document.removeEventListener("mousedown", onClick);
+}, [
+  ponOpen,
+  bellOpen,
+  monthOpen,
+  paymentsOpen,
+  collectorsOpen,
+  fixOpen
+]);
 
   /* ===== Derivados: pagos por cliente / período ===== */
   const approvedByClientByPeriod = useMemo(() => {
@@ -586,8 +628,8 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
     return m;
   }, [approvedAll]);
 
-  /* ===== Decorado clientes (incluye NUEVO monthsDue + badge) ===== */
-  const decorated = useMemo(() => {
+/* ===== Decorado clientes (incluye NUEVO monthsDue + badge) ===== */
+const decorated = useMemo(() => {
   return clients.map((c) => {
     const plan = Math.max(0, Number(c.plan || 0));
     const planMes = planForYM(c, ymNow);
@@ -597,28 +639,28 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
     const saldoMes = Math.max(planMes - aprobadoMes, 0);
     const saldoMesAfterSubmitted = Math.max(planMes - aprobadoMes - submittedMes, 0);
 
+    const monthsUnpaidPrev = monthsUnpaidBeforeCurrent(
+      c,
+      ymNow,
+      approvedByClientByPeriod,
+      submittedByClientByPeriod
+    );
+
     const arrears = computeArrears(c, ymNow, approvedByClientByPeriod);
     const dueReached = dueReachedThisMonth(c.fechaInstalacion);
-    const estado = c.exonerado ? "EXONERADO" : (saldoMes <= 0 ? "PAGADO" : "PENDIENTE");
 
-    // 👉 "Nuevo este mes": creado este mes (fallback a instalación si no hay createdAt)
+    // "Nuevo este mes"
     let isNew = isTimestampInCurrentMonth(c.createdAt);
-    if (!c.createdAt && isInCurrentMonth(c.fechaInstalacion)) isNew = true;
+if (!c.createdAt && isInCurrentMonth(c.fechaInstalacion)) isNew = true;
 
-    // Solo para NUEVOS calculo meses por instalación, ignorando el día.
-    const monthsNewYM = isNew ? monthsSinceInstallYM(c.fechaInstalacion) : 0;
 
-    // Badge visual (prioridad: arrears > 0 ⇒ rojo)
-    let badge = null;
-    if (!c.exonerado && saldoMes > 0) {
-      if (arrears > 0) {
-        badge = { label: "PENDIENTE", cls: "badge-red" };           // Debe meses anteriores
-      } else if (isNew) {
-        if (monthsNewYM >= 2) badge = { label: "PENDIENTE", cls: "badge-red" };   // p.ej. instalación agosto en octubre
-        else if (monthsNewYM === 1) badge = { label: "PENDIENTE", cls: "badge-yellow" }; // instalación mes pasado
-      }
-      // Si no es nuevo y no hay arrears, el color por días se maneja en el render con pendingBadgeForClient
-    }
+    const monthsNewYM = isNew ? monthsUnpaidPrev : 0;
+
+// Igual que Cobrador: cualquier mes vencido previo (>=1) es ROJO
+let badge = null;
+if (!c.exonerado && saldoMes > 0 && monthsUnpaidPrev >= 1) {
+  badge = { label: "PENDIENTE", cls: "badge-red" };
+}
 
     return {
       ...c,
@@ -628,17 +670,16 @@ const ponList = useMemo(() => ["Todos", ...PON_OPTIONS], []);
       submittedMes,
       saldoMes,
       saldoMesAfterSubmitted,
-      estado,
       arrears,
       dueReached,
       lastPaidPeriod: lastPaidPeriodByClient.get(c.id) || "",
-      // Nuevos:
       isNew,
       monthsNewYM,
+      monthsUnpaidPrev,
       badge,
     };
   });
-}, [clients, approvedByClientByPeriod, submittedByClientByPeriod, lastPaidPeriodByClient]);
+}, [clients, approvedByClientByPeriod, submittedByClientByPeriod, lastPaidPeriodByClient, ymNow]);
 
 
 
@@ -743,6 +784,8 @@ if (filterEstado === "Pendiente") {
   }
 
   /* ===== Notas admin ===== */
+  
+
   async function addNoteToClient(c) {
     const msg = prompt(`Nota para ${c.nombre}:`);
     if (!msg || !msg.trim()) return;
@@ -767,218 +810,195 @@ if (filterEstado === "Pendiente") {
   const toggleInfo = (id) => setOpenRows((prev) => ({ ...prev, [id]: !prev[id] }));
 
   /* ===== Registro / edición / eliminar cliente ===== */
-  async function handleRegister(e) {
-    e?.preventDefault();
-    const nombreOk = (nombre || "").trim();
-    const telDigits = (telefono || "").trim();
-    const planStr = String(planForm || "").trim();
-    if (!nombreOk) return alert("Nombre es requerido");
-    if (!fechaInstalacion) return alert("Fecha de instalación es requerida");
-    if (!isValidPhone(telDigits)) {
-      return alert("Teléfono inválido. Debe tener 10 dígitos y comenzar con 09 (ej: 09XXXXXXXX).");
-    }
-    if (!isValidPlan(planStr)) {
-      return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
-    }
-    if (!ponForm) return alert("Selecciona un PON.");
+async function handleRegister(e) {
+  e?.preventDefault();
 
-    const planOk = Number(planStr);
-    await addDoc(collection(db, "clients"), {
-      active: true,
-      createdAt: serverTimestamp(),
-      createdBy: currentUserEmail,
-      nombre: nombreOk,
-      telefono: telDigits,
-      fechaInstalacion,
-      plan: planOk,
-      pon: ponForm,
-      domicilio: (domicilio || "").trim(),
-      lastPaidPeriod: "",
-      alerta: "",
-      exonerado: exoneradoForm,
-      updatedAt: serverTimestamp(),
-      updatedBy: currentUserEmail,
-    });
-    handleClear();
-    alert("Cliente registrado correctamente.");
-  }
-  function handleClear() {
-    setNombre("");
-    setTelefono("");
-    setFechaInstalacion("");
-    setPonForm("");
-    setPlanForm("");
-    setDomicilio("");
-    setExoneradoForm(false);
-  }
-  function startEdit(c) {
-    setEditId(c.id);
-    setEditData({
-      nombre: c.nombre || "",
-      telefono: String(c.telefono || ""),
-      fechaInstalacion: c.fechaInstalacion || "",
-      pon: String(c.pon || ""),
-      plan: String(c.plan ?? ""),
-      domicilio: c.domicilio || "",
-      exonerado: !!c.exonerado,
-    });
-  }
-  function cancelEdit() {
-    setEditId(null);
-    setEditData({
-      nombre: "", telefono: "", fechaInstalacion: "", pon: "", plan: "",
-      domicilio: "", exonerado: false,
-    });
-  }
-  async function saveEdit() {
-    const id = editId;
-    if (!id) return;
-    const nombreOk = (editData.nombre || "").trim();
-    const telDigits = String(editData.telefono || "").trim();
-    const planStr = String(editData.plan || "").trim();
-    const ponOk = String(editData.pon || "").trim();
-    if (!nombreOk) return alert("Nombre es requerido");
-    if (!editData.fechaInstalacion) return alert("Fecha de instalación es requerida");
-    if (!isValidPhone(telDigits)) return alert("Teléfono inválido. Debe iniciar con 09 y tener 10 dígitos");
-    if (!isValidPlan(planStr)) return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
-    if (!ponOk) return alert("Selecciona un PON.");
+  const nombreOk = (nombre || "").trim();
+  const telDigits = (telefono || "").trim();
+  const planStr = String(planForm || "").trim();
 
-    await updateDoc(doc(db, "clients", id), {
-      nombre: nombreOk,
-      telefono: telDigits,
-      fechaInstalacion: editData.fechaInstalacion,
-      pon: ponOk,
-      plan: Number(planStr),
-      domicilio: (editData.domicilio || "").trim(),
-      exonerado: !!editData.exonerado,
-      updatedAt: serverTimestamp(),
-      updatedBy: currentUserEmail,
-    });
-    cancelEdit();
-    alert("Cliente actualizado ✅");
+  if (!nombreOk) return alert("Nombre es requerido");
+  if (!fechaInstalacion) return alert("Fecha de instalación es requerida");
+  if (!isValidPhone(telDigits)) {
+    return alert("Teléfono inválido. Debe tener 10 dígitos y comenzar con 09 (ej: 09XXXXXXXX).");
   }
-  async function handleDelete(c) {
-    const ps = await getDocs(query(collection(db, "payments"), where("clientId", "==", c.id)));
-    const count = ps.size;
-    const msg1 =
-      count > 0
-        ? `Este cliente tiene ${count} pago(s) en la colección "payments".`
-        : "Este cliente no tiene pagos registrados.";
-    if (
-      !confirm(
-        `${msg1}\n\nSe eliminará SOLO el documento del cliente (no se tocarán pagos).\n¿Deseas continuar?`
-      )
-    ) {
-      return;
-    }
-    await deleteDoc(doc(db, "clients", c.id));
-    alert("Cliente eliminado.");
+  if (!isValidPlan(planStr)) {
+    return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
+  }
+  if (!ponForm) return alert("Selecciona un PON.");
+
+  const planOk = Number(planStr);
+  await addDoc(collection(db, "clients"), {
+    active: true,
+    createdAt: serverTimestamp(),
+    createdBy: currentUserEmail,
+    nombre: nombreOk,
+    telefono: telDigits,
+    fechaInstalacion,
+    plan: planOk,
+    pon: ponForm,
+    domicilio: (domicilio || "").trim(),
+    lastPaidPeriod: "",
+    alerta: "",
+    exonerado: exoneradoForm,
+    updatedAt: serverTimestamp(),
+    updatedBy: currentUserEmail,
+  });
+
+  handleClear();
+  alert("Cliente registrado correctamente.");
+}
+
+function handleClear() {
+  setNombre("");
+  setTelefono("");
+  setFechaInstalacion("");
+  setPonForm("");
+  setPlanForm("");
+  setDomicilio("");
+  setExoneradoForm(false);
+}
+
+function startEdit(c) {
+  setEditId(c.id);
+  setEditData({
+    nombre: c.nombre || "",
+    telefono: String(c.telefono || ""),
+    fechaInstalacion: c.fechaInstalacion || "",
+    pon: String(c.pon || ""),
+    plan: String(c.plan ?? ""),
+    domicilio: c.domicilio || "",
+    exonerado: !!c.exonerado,
+  });
+}
+
+function cancelEdit() {
+  setEditId(null);
+  setEditData({
+    nombre: "", telefono: "", fechaInstalacion: "", pon: "", plan: "",
+    domicilio: "", exonerado: false,
+  });
+}
+
+async function saveEdit() {
+  const id = editId;
+  if (!id) return;
+  const nombreOk = (editData.nombre || "").trim();
+  const telDigits = String(editData.telefono || "").trim();
+  const planStr = String(editData.plan || "").trim();
+  const ponOk = String(editData.pon || "").trim();
+
+  if (!nombreOk) return alert("Nombre es requerido");
+  if (!editData.fechaInstalacion) return alert("Fecha de instalación es requerida");
+  if (!isValidPhone(telDigits)) return alert("Teléfono inválido. Debe iniciar con 09 y tener 10 dígitos");
+  if (!isValidPlan(planStr)) return alert("Plan inválido. Debe ser numérico de hasta 3 dígitos (0 a 999).");
+  if (!ponOk) return alert("Selecciona un PON.");
+
+  await updateDoc(doc(db, "clients", id), {
+    nombre: nombreOk,
+    telefono: telDigits,
+    fechaInstalacion: editData.fechaInstalacion,
+    pon: ponOk,
+    plan: Number(planStr),
+    domicilio: (editData.domicilio || "").trim(),
+    exonerado: !!editData.exonerado,
+    updatedAt: serverTimestamp(),
+    updatedBy: currentUserEmail,
+  });
+
+  cancelEdit();
+  alert("Cliente actualizado ✅");
+}
+
+async function handleDelete(c) {
+  const ps = await getDocs(query(collection(db, "payments"), where("clientId", "==", c.id)));
+  const count = ps.size;
+  const msg1 =
+    count > 0
+      ? `Este cliente tiene ${count} pago(s) en la colección "payments".`
+      : "Este cliente no tiene pagos registrados.";
+  if (
+    !confirm(
+      `${msg1}\n\nSe eliminará SOLO el documento del cliente (no se tocarán pagos).\n¿Deseas continuar?`
+    )
+  ) return;
+
+  await deleteDoc(doc(db, "clients", c.id));
+  alert("Cliente eliminado.");
+}
+
+  /* ===== Cobro (FIFO) ===== */
+async function handleCharge(c) {
+  if (c.exonerado) {
+    alert("Cliente exonerado: no se puede registrar cobros.");
+    return;
   }
 
-  /* ===== Cobro (FIFO) y revertir ===== */
-  async function handleCharge(c) {
-    if (c.exonerado) {
-      alert("Cliente exonerado: no se puede registrar cobros.");
-      return;
-    }
-    const installYM = ymFromISO(c.fechaInstalacion);
-    let ym = cmpYM(installYM, ymNow) >= 0 ? ymNow : incYM(installYM);
-    let targetPeriod = ymNow;
-    while (true) {
-      const planMes = planForYM(c, ym);
-      if (planMes > 0) {
-        const ap = approvedByClientByPeriod.get(c.id)?.get(ym) || 0;
-        const sb = submittedByClientByPeriod.get(c.id)?.get(ym) || 0;
-        if (ap + sb < planMes) {
-          targetPeriod = ym;
-          break;
-        }
-      }
-      if (ym === ymNow) {
-        targetPeriod = ymNow;
+  // Fallback al mes actual si falta/está mal la fecha de instalación
+  const installYM = ymFromISO(c.fechaInstalacion) || ymNow;
+let ym = cmpYM(installYM, ymNow) >= 0 ? ymNow : incYM(installYM);
+  let targetPeriod = ymNow;
+
+  while (true) {
+    const planMes = planForYM(c, ym);
+    if (planMes > 0) {
+      const ap = approvedByClientByPeriod.get(c.id)?.get(ym) || 0;
+      const sb = submittedByClientByPeriod.get(c.id)?.get(ym) || 0;
+      if (ap + sb < planMes) {
+        targetPeriod = ym;
         break;
       }
-      ym = incYM(ym);
     }
-    const planMes = planForYM(c, targetPeriod);
-    if (planMes <= 0) {
-      alert(`El período ${targetPeriod} no genera cargo (instalación).`);
-      return;
+    if (ym === ymNow) {
+      targetPeriod = ymNow;
+      break;
     }
-    const apMes = approvedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0;
-    const sbMes = submittedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0;
-    const restanteMes = Math.max(planMes - apMes - sbMes, 0);
-    if (restanteMes <= 0) {
-      alert(`El mes ${targetPeriod} ya está cubierto.`);
-      return;
-    }
-    const inp = prompt(
-      `Cobro para ${c.nombre}
+    ym = incYM(ym);
+  }
+
+  const planMes = planForYM(c, targetPeriod);
+  if (planMes <= 0) {
+    alert(`El período ${targetPeriod} no genera cargo (instalación).`);
+    return;
+  }
+
+  const apMes = approvedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0;
+  const sbMes = submittedByClientByPeriod.get(c.id)?.get(targetPeriod) || 0;
+  const restanteMes = Math.max(planMes - apMes - sbMes, 0);
+  if (restanteMes <= 0) {
+    alert(`El mes ${targetPeriod} ya está cubierto.`);
+    return;
+  }
+
+  const inp = prompt(
+    `Cobro para ${c.nombre}
 Mes destino: ${targetPeriod}
 Plan (mes): ${money(planMes)}
 Pagado+enviado en ese mes: ${money(apMes + sbMes)}
 Restante de ese mes: ${money(restanteMes)}
 Ingresa monto (<= restante)`,
-      String(restanteMes)
-    );
-    if (inp == null) return;
-    const amount = Number(inp);
-    if (!(amount > 0)) return alert("Monto inválido");
-    if (amount > restanteMes) return alert("No puede superar el saldo restante de ese mes");
-    const type = amount >= restanteMes ? "total" : "parcial";
-    await addDoc(collection(db, "payments"), {
-      clientId: c.id,
-      amount,
-      period: targetPeriod,
-      type,
-      status: "submitted",
-      createdAt: serverTimestamp(),
-      createdBy: currentUserEmail,
-      batchDate: todayISO(), // fecha LOCAL del cobro
-    });
-    alert(`Pago enviado. Aplicado al período ${targetPeriod}.`);
-  }
+    String(restanteMes)
+  );
+  if (inp == null) return;
 
-  async function handleRevertMonth(c) {
-    if (
-      !confirm(
-        `Revertir pagos del período ${period} para ${c.nombre}?\n- 'approved' → 'reversed'\n- 'submitted' → 'rejected'`
-      )
-    )
-      return;
+  const amount = Number(inp);
+  if (!(amount > 0)) return alert("Monto inválido");
+  if (amount > restanteMes) return alert("No puede superar el saldo restante de ese mes");
+  const type = amount >= restanteMes ? "total" : "parcial";
 
-    const qa = query(
-      collection(db, "payments"),
-      where("clientId", "==", c.id),
-      where("period", "==", period),
-      where("status", "==", "approved")
-    );
-    const sa = await getDocs(qa);
-    for (const d of sa.docs) {
-      await updateDoc(doc(db, "payments", d.id), {
-        status: "reversed",
-        updatedAt: serverTimestamp(),
-        updatedBy: currentUserEmail,
-      });
-    }
+  await addDoc(collection(db, "payments"), {
+    clientId: c.id,
+    amount,
+    period: targetPeriod,
+    type,
+    status: "submitted",
+    createdAt: serverTimestamp(),
+    createdBy: currentUserEmail,
+    batchDate: todayISO(), // fecha LOCAL del cobro
+  });
 
-    const qs = query(
-      collection(db, "payments"),
-      where("clientId", "==", c.id),
-      where("period", "==", period),
-      where("status", "==", "submitted")
-    );
-    const ss = await getDocs(qs);
-    for (const d of ss.docs) {
-      await updateDoc(doc(db, "payments", d.id), {
-        status: "rejected",
-        updatedAt: serverTimestamp(),
-        updatedBy: currentUserEmail,
-      });
-    }
-    alert("Reversión aplicada sobre el período actual.");
-  }
-
+  alert(`Pago enviado. Aplicado al período ${targetPeriod}.`);
+}
   /* ===== Listas por fecha (agrupación A∪B y NETO) ===== */
   function buildGroupsFrom(paymentsRows, expensesRows) {
     const byCollector = new Map();
@@ -1047,64 +1067,82 @@ Ingresa monto (<= restante)`,
   }
 
   // Suscripción cuando se abre "Listas y cobros"
-  useEffect(() => {
-    if (!listsOpen) return;
+useEffect(() => {
+  if (!listsOpen) return;
 
-    const start = new Date(dateFilter + "T00:00:00");
-    const end = new Date(dateFilter + "T23:59:59.999");
-    const startBuf = new Date(start.getTime() - 6 * 60 * 60 * 1000);
-    const endBuf = new Date(end.getTime() + 6 * 60 * 60 * 1000);
+  const start = new Date(dateFilter + "T00:00:00");
+  const end = new Date(dateFilter + "T23:59:59.999");
+  const startBuf = new Date(start.getTime() - 6 * 60 * 60 * 1000);
+  const endBuf = new Date(end.getTime() + 6 * 60 * 60 * 1000);
 
-    const matchCollector = (x) =>
-      collectorFilter === "Todos" || x.createdBy === collectorFilter;
+  const matchCollector = (x) =>
+    collectorFilter === "Todos" || x.createdBy === collectorFilter;
 
-    let payA = [], payB = [], expA = [], expB = [];
+  let payA = [], payB = [], expA = [], expB = [];
 
-    const recompute = () => {
-      const payUnionRaw = uniqById([...payA, ...payB]);
-      const payConsolidated = consolidatePayments(payUnionRaw).filter(matchCollector);
-      const expUnion = uniqById([...expA, ...expB]).filter(matchCollector);
-      buildGroupsFrom(payConsolidated, expUnion);
-    };
+  const recompute = () => {
+    // Unión A∪B + consolidado
+    const payUnionRaw = uniqById([...payA, ...payB]);
 
-    const unsubPaymentsA = onSnapshot(
-      query(collection(db, "payments"), where("batchDate", "==", dateFilter), orderBy("createdAt", "desc")),
-      (snap) => { payA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
-    );
-    const unsubPaymentsB = onSnapshot(
-      query(
-        collection(db, "payments"),
-        where("createdAt", ">=", startBuf),
-        where("createdAt", "<=", endBuf),
-        orderBy("createdAt", "desc")
-      ),
-      (snap) => { payB = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
-    );
+    // 1) consolidar
+    // 2) filtrar por cobrador
+    // 3) (nuevo) ocultar rechazados si corresponde
+    let payConsolidated = consolidatePayments(payUnionRaw).filter(matchCollector);
+    if (!showRejected) {
+      payConsolidated = payConsolidated.filter((p) => String(p.status) !== "rejected");
+    }
 
-    const unsubExpensesA = onSnapshot(
-      query(collection(db, "expenses"), where("batchDate", "==", dateFilter), orderBy("createdAt", "desc")),
-      (snap) => { expA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
-    );
-    const unsubExpensesB = onSnapshot(
-      query(
-        collection(db, "expenses"),
-        where("createdAt", ">=", startBuf),
-        where("createdAt", "<=", endBuf),
-        orderBy("createdAt", "desc")
-      ),
-      (snap) => { expB = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
-    );
+    const expUnion = uniqById([...expA, ...expB]).filter(matchCollector);
 
-    return () => {
-      unsubPaymentsA && unsubPaymentsA();
-      unsubPaymentsB && unsubPaymentsB();
-      unsubExpensesA && unsubExpensesA();
-      unsubExpensesB && unsubExpensesB();
-    };
-  }, [listsOpen, dateFilter, collectorFilter]);
+    // Construye grupos y setea estado
+    buildGroupsFrom(payConsolidated, expUnion);
+  };
+
+  // Pagos por fecha "batchDate"
+  const unsubPaymentsA = onSnapshot(
+    query(collection(db, "payments"), where("batchDate", "==", dateFilter), orderBy("createdAt", "desc")),
+    (snap) => { payA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
+  );
+
+  // Pagos por ventana de createdAt (buffer horario)
+  const unsubPaymentsB = onSnapshot(
+    query(
+      collection(db, "payments"),
+      where("createdAt", ">=", startBuf),
+      where("createdAt", "<=", endBuf),
+      orderBy("createdAt", "desc")
+    ),
+    (snap) => { payB = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
+  );
+
+  // Gastos por batchDate
+  const unsubExpensesA = onSnapshot(
+    query(collection(db, "expenses"), where("batchDate", "==", dateFilter), orderBy("createdAt", "desc")),
+    (snap) => { expA = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
+  );
+
+  // Gastos por ventana de createdAt (buffer horario)
+  const unsubExpensesB = onSnapshot(
+    query(
+      collection(db, "expenses"),
+      where("createdAt", ">=", startBuf),
+      where("createdAt", "<=", endBuf),
+      orderBy("createdAt", "desc")
+    ),
+    (snap) => { expB = snap.docs.map((d) => ({ id: d.id, ...d.data() })); recompute(); }
+  );
+
+  return () => {
+    unsubPaymentsA && unsubPaymentsA();
+    unsubPaymentsB && unsubPaymentsB();
+    unsubExpensesA && unsubExpensesA();
+    unsubExpensesB && unsubExpensesB();
+  };
+}, [listsOpen, dateFilter, collectorFilter, showRejected]); // ← solo UNA línea
+
 
   /* ===== BALANCE (suscripciones) ===== */
-  const [monthOpenLocal, setMonthOpenLocal] = [monthOpen, setMonthOpen]; // alias para claridad
+  const monthOpenLocal = monthOpen; // alias para claridad
 
   useEffect(() => {
     if (!monthOpenLocal) return;
@@ -1521,8 +1559,8 @@ Ingresa monto (<= restante)`,
               </div>
             )}
           </div>
-
-          {/* CAMPANA */}
+          
+        {/* CAMPANA */}
           <div style={{ position: "relative" }} ref={bellRef}>
             <button onClick={() => setBellOpen((v) => !v)} title="Comentarios" style={{ position: "relative" }}>
               🔔
@@ -1725,22 +1763,23 @@ Ingresa monto (<= restante)`,
             {ponSel === "Todos" ? "PON ▾" : `${ponSel} ▾`}
           </button>
           {ponOpen && (
-            <div
-              style={{
-                position: "absolute",
-                top: "110%",
-                left: 0,
-                background: "#fff",
-                border: "1px solid #362525ff",
-                borderRadius: 8,
-                boxShadow: "0 8px 20px rgba(0,0,0,.12)",
-                minWidth: 200,
-                zIndex: 5,
-                padding: 6,
-                maxHeight: 260,
-                overflow: "auto",
-              }}
-            >
+  <div
+    style={{
+      position: "absolute",
+      top: "110%",
+      left: 0,
+      background: "#fff",
+      border: "1px solid #362525ff",   // ← CAMBIA ESTA LÍNEA
+      borderRadius: 8,
+      boxShadow: "0 8px 20px rgba(0,0,0,.12)",
+      minWidth: 200,
+      zIndex: 5,
+      padding: 6,
+      maxHeight: 260,
+      overflow: "auto",
+    }}
+  >
+
               {ponList.map((p) => (
   <div
     key={p}
@@ -1782,44 +1821,60 @@ Ingresa monto (<= restante)`,
             padding: 12,
           }}
         >
-          {/* Filtros Listas */}
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "150px 260px 1fr",
-              gap: 10,
-              alignItems: "center",
-              marginBottom: 10,
-            }}
-          >
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <label style={{ fontSize: 12, color: "#555" }}>Fecha</label>
-              <input
-                type="date"
-                value={dateFilter}
-                onChange={(e) => setDateFilter(e.target.value)}
-                autoComplete="off"
-                data-lpignore="true"
-              />
-            </div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <label style={{ fontSize: 12, color: "#555" }}>Cobrador</label>
-              <select
-                value={collectorFilter}
-                onChange={(e) => setCollectorFilter(e.target.value)}
-                style={{ minWidth: 200 }}
-              >
-                {collectorOptions.map((op) => (
-                  <option key={op} value={op}>
-                    {op === "Todos" ? "Todos" : labelFromMaps(op, collectorLabels)}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div style={{ textAlign: "right", color: "#666", fontSize: 12 }}>
-              {dateFilter ? `Mostrando listas del ${dateFilter}` : "Elige una fecha para filtrar"}
-            </div>
-          </div>
+{/* Filtros Listas */}
+<div
+  style={{
+    display: "grid",
+    gridTemplateColumns: "150px 260px auto 1fr", // 4 columnas
+    gap: 10,
+    alignItems: "center",
+    marginBottom: 10,
+  }}
+>
+  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+    <label style={{ fontSize: 12, color: "#555" }}>Fecha</label>
+    <input
+      type="date"
+      value={dateFilter}
+      onChange={(e) => setDateFilter(e.target.value)}
+      autoComplete="off"
+      data-lpignore="true"
+    />
+  </div>
+
+  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+    <label style={{ fontSize: 12, color: "#555" }}>Cobrador</label>
+    <select
+      value={collectorFilter}
+      onChange={(e) => setCollectorFilter(e.target.value)}
+      style={{ minWidth: 200 }}
+    >
+      {collectorOptions.map((op) => (
+        <option key={op} value={op}>
+          {op === "Todos" ? "Todos" : labelFromMaps(op, collectorLabels)}
+        </option>
+      ))}
+    </select>
+  </div>
+
+  {/* ⬇️ Nuevo toggle */}
+  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+    <input
+      id="toggle-rejected"
+      type="checkbox"
+      checked={showRejected}
+      onChange={(e) => setShowRejected(e.target.checked)}
+    />
+    <label htmlFor="toggle-rejected" style={{ fontSize: 12, color: "#555" }}>
+      Mostrar rechazados
+    </label>
+  </div>
+
+  <div style={{ textAlign: "right", color: "#666", fontSize: 12 }}>
+    {dateFilter ? `Mostrando listas del ${dateFilter}` : "Elige una fecha para filtrar"}
+  </div>
+</div>
+
 
           {/* Contenido Listas */}
           {!listGroups.length ? (
@@ -2027,7 +2082,7 @@ Ingresa monto (<= restante)`,
     </span>
   )}
 </div>
-
+{/* Chip si el cliente tiene recordatorio activo */}
 
               {/* ESTADO */}
               <div>
@@ -2064,27 +2119,27 @@ Ingresa monto (<= restante)`,
                     PAGADO
                   </span>
                 ) : c.badge ? (
-                  // NUEVO: badge por meses vencidos (1 = amarillo, >=2 = rojo)
-                  <span
-                    style={{
-                      fontSize: 12,
-                      padding: "2px 8px",
-                      borderRadius: 999,
-                      marginRight: 8,
-                      fontWeight: 700,
-                      textTransform: "uppercase",
-                      ...badgeStyle(c.badge.cls),
-                    }}
-                   title={
-  c.monthsNewYM >= 2
-    ? "Tiene 2 meses o más vencidos desde la instalación"
-    : "Tiene 1 mes vencido desde la instalación"
-}
+  <span
+    style={{
+      fontSize: 12,
+      padding: "2px 8px",
+      borderRadius: 999,
+      marginRight: 8,
+      fontWeight: 700,
+      textTransform: "uppercase",
+      ...badgeStyle(c.badge.cls),
+    }}
+    // ⬇️ Reemplaza TODO el title por este:
+    title={
+      c.monthsUnpaidPrev >= 1
+        ? `Tiene ${c.monthsUnpaidPrev} mes${c.monthsUnpaidPrev>1?"es":""} vencido${c.monthsUnpaidPrev>1?"s":""} (anteriores al actual)`
+        : undefined
+    }
+  >
+    {c.badge.label}
+  </span>
+) : !dueReachedThisMonth(c.fechaInstalacion) ? (
 
-                  >
-                    {c.badge.label}
-                  </span>
-                ) : !dueReachedThisMonth(c.fechaInstalacion) ? (
                   <span
                     style={{
                       fontSize: 12,
@@ -2201,22 +2256,22 @@ Ingresa monto (<= restante)`,
                 )}
                 <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <button onClick={() => addNoteToClient(c)}>Añadir nota</button>
-                  <button
-                    onClick={() => clearNoteFromClient(c)}
-                    disabled={!c.alerta}
-                    title={c.alerta ? "Eliminar nota" : "Sin nota"}
-                  >
-                    Eliminar nota
-                  </button>
-                  <button onClick={() => startEdit(c)}>Editar</button>
-                  <button
-                    onClick={() => handleDelete(c)}
-                    style={{ background: "#fff0f0", border: "1px solid #f2b5b5" }}
-                    title="Eliminar cliente (no elimina sus pagos)"
-                  >
-                    Eliminar
-                  </button>
-                  <button onClick={() => handleRevertMonth(c)}>Revertir mes actual</button>
+
+<button onClick={() => clearNoteFromClient(c)}>
+  Eliminar nota
+</button>
+
+<button onClick={() => startEdit(c)}>Editar</button>
+
+<button
+  onClick={() => handleDelete(c)}
+  style={{ background: "#fff0f0", border: "1px solid #f2b5b5" }}
+  title="Eliminar cliente (no elimina sus pagos)"
+>
+  Eliminar
+</button>
+
+<button onClick={() => handleRevertMonth(c)}>Revertir mes actual</button>
                 </div>
               </div>
             )}
